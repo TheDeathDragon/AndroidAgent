@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-36 build-tools;36.0.0'
+
+      - name: Replace android.jar with unstripped (Reginer/aosp-android-jar)
+        run: |
+          API=36
+          DEST="$ANDROID_SDK_ROOT/platforms/android-$API/android.jar"
+          curl -fL --retry 3 -o "$DEST" \
+            "https://raw.githubusercontent.com/Reginer/aosp-android-jar/main/android-$API/android.jar"
+          ls -la "$DEST"
+
+      - name: Build
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Stage jar
+        run: |
+          mkdir -p build/dist
+          cp build/outputs/apk/release/agent-server-release-unsigned.apk build/dist/agent-server.jar
+          ls -la build/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-server-${{ github.sha }}
+          path: build/dist/agent-server.jar
+          retention-days: 7

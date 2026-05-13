@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9][0-9][0-9][0-9].[0-9][0-9][0-9][0-9]'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-36 build-tools;36.0.0'
+
+      - name: Replace android.jar with unstripped (Reginer/aosp-android-jar)
+        run: |
+          API=36
+          DEST="$ANDROID_SDK_ROOT/platforms/android-$API/android.jar"
+          curl -fL --retry 3 -o "$DEST" \
+            "https://raw.githubusercontent.com/Reginer/aosp-android-jar/main/android-$API/android.jar"
+          ls -la "$DEST"
+
+      - name: Resolve version from tag
+        id: ver
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}' -replace '^v', ''
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Extract changelog section
+        shell: pwsh
+        run: |
+          $body = & ./scripts/extract_changelog.ps1 -Version '${{ steps.ver.outputs.version }}'
+          $body | Out-File release_notes.md -Encoding utf8 -NoNewline
+
+      - name: Build
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Stage release asset
+        run: |
+          mkdir -p release-stage
+          cp build/outputs/apk/release/agent-server-release-unsigned.apk \
+             release-stage/agent-server-${{ steps.ver.outputs.version }}.jar
+          ls -la release-stage
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ steps.ver.outputs.version }}
+          body_path: release_notes.md
+          files: release-stage/*
+          draft: false
+          prerelease: false
