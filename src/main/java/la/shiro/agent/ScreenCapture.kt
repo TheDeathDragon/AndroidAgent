@@ -1,19 +1,24 @@
 package la.shiro.agent
 
 import android.annotation.SuppressLint
+import android.annotation.TargetApi
 import android.app.UiAutomation
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.graphics.Point
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.DisplayManagerGlobal
 import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.IBinder
 import android.view.Surface
 import java.io.ByteArrayOutputStream
+import java.lang.reflect.InvocationTargetException
 import java.nio.ByteBuffer
 import java.util.ArrayDeque
 import java.util.Locale
@@ -129,9 +134,49 @@ internal class ExposedByteArrayOutputStream(
     }
 }
 
-// Isolated helper so R8 does not inline the Android 14+ static 5-arg hidden API into ScreenCapture.
+internal interface MirrorDisplay : AutoCloseable
+
+// Keep API 34+ static DisplayManager.createVirtualDisplay isolated so R8 does not inline it into ScreenCapture on API 29-33.
 internal object VirtualDisplayFactory {
     fun create(
+        name: String,
+        displayWidth: Int,
+        displayHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        displayIdToMirror: Int,
+        layerStack: Int,
+        surface: Surface
+    ): MirrorDisplay? {
+        if (Build.VERSION.SDK_INT >= 34) {
+            try {
+                val vd = createApi34(name, targetWidth, targetHeight, displayIdToMirror, surface)
+                    ?: return null
+                val released = AtomicBoolean(false)
+                return object : MirrorDisplay {
+                    override fun close() {
+                        if (released.compareAndSet(false, true)) {
+                            vd.release()
+                        }
+                    }
+                }
+            } catch (_: NoSuchMethodError) {
+                // Fall back to SurfaceControl reflection when this build lacks the API 34+ static overload.
+            }
+        }
+        return createViaSurfaceControl(
+            name = name,
+            displayWidth = displayWidth,
+            displayHeight = displayHeight,
+            targetWidth = targetWidth,
+            targetHeight = targetHeight,
+            layerStack = layerStack,
+            surface = surface
+        )
+    }
+
+    @TargetApi(34)
+    private fun createApi34(
         name: String,
         width: Int,
         height: Int,
@@ -139,6 +184,83 @@ internal object VirtualDisplayFactory {
         surface: Surface
     ): VirtualDisplay? {
         return DisplayManager.createVirtualDisplay(name, width, height, displayIdToMirror, surface)
+    }
+
+    @SuppressLint("PrivateApi", "DiscouragedPrivateApi")
+    private fun createViaSurfaceControl(
+        name: String,
+        displayWidth: Int,
+        displayHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        layerStack: Int,
+        surface: Surface
+    ): MirrorDisplay? {
+        val sc = Class.forName("android.view.SurfaceControl")
+        val createDisplay = sc.getMethod("createDisplay", String::class.java, Boolean::class.javaPrimitiveType)
+        val openTransaction = sc.getMethod("openTransaction")
+        val closeTransaction = sc.getMethod("closeTransaction")
+        val setDisplaySurface = sc.getMethod("setDisplaySurface", IBinder::class.java, Surface::class.java)
+        val setDisplayProjection = sc.getMethod(
+            "setDisplayProjection",
+            IBinder::class.java,
+            Int::class.javaPrimitiveType,
+            Rect::class.java,
+            Rect::class.java
+        )
+        val setDisplayLayerStack = sc.getMethod("setDisplayLayerStack", IBinder::class.java, Int::class.javaPrimitiveType)
+        val destroyDisplay = sc.getMethod("destroyDisplay", IBinder::class.java)
+
+        // API 29-30 allow shell uid to create secure mirror displays; API 31-33 reject secure=true without READ_FRAME_BUFFER.
+        val trySecure = Build.VERSION.SDK_INT < 31
+        val token: IBinder = try {
+            createDisplay.invoke(null, name, trySecure) as? IBinder
+        } catch (e: InvocationTargetException) {
+            if (trySecure && e.cause is SecurityException) {
+                try {
+                    createDisplay.invoke(null, name, false) as? IBinder
+                } catch (retryError: InvocationTargetException) {
+                    throw retryError.cause ?: retryError
+                }
+            } else {
+                throw e.cause ?: e
+            }
+        } ?: return null
+
+        try {
+            openTransaction.invoke(null)
+            try {
+                setDisplaySurface.invoke(null, token, surface)
+                setDisplayProjection.invoke(
+                    null,
+                    token,
+                    Surface.ROTATION_0,
+                    Rect(0, 0, displayWidth, displayHeight),
+                    Rect(0, 0, targetWidth, targetHeight)
+                )
+                setDisplayLayerStack.invoke(null, token, layerStack)
+            } finally {
+                closeTransaction.invoke(null)
+            }
+        } catch (t: Throwable) {
+            try {
+                destroyDisplay.invoke(null, token)
+            } catch (_: Throwable) {
+            }
+            throw (if (t is InvocationTargetException) t.cause ?: t else t)
+        }
+
+        val released = AtomicBoolean(false)
+        return object : MirrorDisplay {
+            override fun close() {
+                if (released.compareAndSet(false, true)) {
+                    try {
+                        destroyDisplay.invoke(null, token)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -148,6 +270,7 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
         val displayWidth: Int,
         val displayHeight: Int,
         val rotation: Int,
+        val layerStack: Int,
         val targetWidth: Int,
         val targetHeight: Int
     )
@@ -156,7 +279,7 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
         object Uninitialized : VirtualDisplayState()
         class Active(
             val config: SurfaceConfig,
-            val virtualDisplay: VirtualDisplay,
+            val mirrorDisplay: MirrorDisplay,
             val imageReader: ImageReader,
             val frameLock: ReentrantLock,
             val frameReady: Condition,
@@ -309,12 +432,15 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
             PixelFormat.RGBA_8888,
             IMAGE_READER_MAX_IMAGES
         )
-        val virtualDisplay = try {
+        val mirrorDisplay = try {
             VirtualDisplayFactory.create(
                 MIRROR_DISPLAY_NAME,
+                desired.displayWidth,
+                desired.displayHeight,
                 desired.targetWidth,
                 desired.targetHeight,
                 DEFAULT_DISPLAY_ID,
+                desired.layerStack,
                 reader.surface
             )
         } catch (t: Throwable) {
@@ -325,7 +451,7 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
             return null
         }
 
-        if (virtualDisplay == null) {
+        if (mirrorDisplay == null) {
             try { reader.close() } catch (_: Throwable) {}
             state = VirtualDisplayState.Unavailable("createVirtualDisplay returned null")
             return null
@@ -334,7 +460,7 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
         val frameLock = ReentrantLock()
         val active = VirtualDisplayState.Active(
             config = desired,
-            virtualDisplay = virtualDisplay,
+            mirrorDisplay = mirrorDisplay,
             imageReader = reader,
             frameLock = frameLock,
             frameReady = frameLock.newCondition(),
@@ -493,17 +619,23 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
     }
 
     private fun readDesiredSurfaceConfig(scale: Float): SurfaceConfig? {
+        val dmGlobal = DisplayManagerGlobal.getInstance()
         val display = try {
-            DisplayManagerGlobal.getInstance().getRealDisplay(DEFAULT_DISPLAY_ID)
+            dmGlobal.getRealDisplay(DEFAULT_DISPLAY_ID)
         } catch (_: Throwable) {
             null
         } ?: return null
         val size = Point()
         display.getRealSize(size)
         if (size.x <= 0 || size.y <= 0) return null
+        val layerStack = try {
+            dmGlobal.getDisplayInfo(DEFAULT_DISPLAY_ID)?.layerStack ?: 0
+        } catch (_: Throwable) {
+            0
+        }
         val targetW = if (scale == 1.0f) size.x else (size.x * scale).roundToInt().coerceAtLeast(1)
         val targetH = if (scale == 1.0f) size.y else (size.y * scale).roundToInt().coerceAtLeast(1)
-        return SurfaceConfig(size.x, size.y, display.rotation, targetW, targetH)
+        return SurfaceConfig(size.x, size.y, display.rotation, layerStack, targetW, targetH)
     }
 
     private fun ensureMirrorHandlerLocked(): Handler {
@@ -522,7 +654,7 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
             active.frameReady.signalAll()
         }
         try { active.imageReader.setOnImageAvailableListener(null, null) } catch (_: Throwable) {}
-        try { active.virtualDisplay.release() } catch (_: Throwable) {}
+        try { active.mirrorDisplay.close() } catch (_: Throwable) {}
         try { active.imageReader.close() } catch (_: Throwable) {}
         try { active.encodeBitmap?.recycle() } catch (_: Throwable) {}
         active.encodeBitmap = null

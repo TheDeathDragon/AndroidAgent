@@ -20,8 +20,8 @@ The release output is written to `build/dist/agent-server.jar`. When `../tools/`
 
 ## Project constraints
 
-- `build.gradle.kts` targets `minSdk = 30` and `compileSdk = 36` with Java 11 and zero external dependencies. Keep `dependencies {}` empty so the artifact stays a small standalone DEX JAR for `app_process`.
+- `build.gradle.kts` targets `minSdk = 29` and `compileSdk = 36` with Java 11 and zero external dependencies. Keep `dependencies {}` empty so the artifact stays a small standalone DEX JAR for `app_process`.
 - `Server.kt` runs under `shell` uid (2000) with no installed APK and no root requirement.
 - `SimpleHttpServer.kt` binds to `127.0.0.1` only. Reach it from the host through `adb forward`.
 - `UiAutomation` is a per-device singleton. Another `UiAutomation` client on the same device fails to connect while this server is active.
-- Hidden APIs that compile against `android-36/android.jar` can still crash with `NoSuchMethodError` or `NoClassDefFoundError` on Android 11 to 15. Guard version-sensitive private calls or prefer public APIs when available.
+- Hidden APIs that compile against `android-36/android.jar` can still crash with `NoSuchMethodError` or `NoClassDefFoundError` on Android 10 to 17. Guard version-sensitive private calls or prefer public APIs when available.

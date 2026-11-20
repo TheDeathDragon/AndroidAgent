@@ -32,7 +32,7 @@ android {
 
     defaultConfig {
         applicationId = "la.shiro.agent"
-        minSdk = 30
+        minSdk = 29
         targetSdk = 36
         versionCode = agentVersionCode
         versionName = agentVersion
