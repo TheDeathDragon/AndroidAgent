@@ -15,22 +15,28 @@ import java.io.StringWriter
 
 class UiHierarchy(private val uiAutomation: UiAutomation) {
 
+    private val dumpLock = Any()
+    private var lastCompressed: Boolean? = null
+
     fun dump(compressed: Boolean): String {
-        configureCompression(compressed)
-        val display = DisplayManagerGlobal.getInstance().getRealDisplay(0)
-        val rotation: Int = display.rotation
-        val size = Point()
-        display.getRealSize(size)
-        val root: AccessibilityNodeInfo = uiAutomation.rootInActiveWindow
-            ?: return "<?xml version=\"1.0\" encoding=\"UTF-8\"?><hierarchy rotation=\"$rotation\"/>"
-        return try {
-            buildXml(root, rotation, size.x, size.y)
-        } finally {
-            root.recycle()
+        synchronized(dumpLock) {
+            configureCompressionLocked(compressed)
+            val display = DisplayManagerGlobal.getInstance().getRealDisplay(0)
+            val rotation: Int = display.rotation
+            val size = Point()
+            display.getRealSize(size)
+            val root: AccessibilityNodeInfo = uiAutomation.rootInActiveWindow
+                ?: return "<?xml version=\"1.0\" encoding=\"UTF-8\"?><hierarchy rotation=\"$rotation\" width=\"${size.x}\" height=\"${size.y}\"/>"
+            return try {
+                buildXml(root, rotation, size.x, size.y)
+            } finally {
+                root.recycle()
+            }
         }
     }
 
-    private fun configureCompression(compressed: Boolean) {
+    private fun configureCompressionLocked(compressed: Boolean) {
+        if (lastCompressed == compressed) return
         val serviceInfo = uiAutomation.serviceInfo ?: return
         if (compressed) {
             serviceInfo.flags = serviceInfo.flags and FLAG_INCLUDE_NOT_IMPORTANT_VIEWS.inv()
@@ -38,6 +44,7 @@ class UiHierarchy(private val uiAutomation: UiAutomation) {
             serviceInfo.flags = serviceInfo.flags or FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
         }
         uiAutomation.serviceInfo = serviceInfo
+        lastCompressed = compressed
     }
 
     private fun buildXml(root: AccessibilityNodeInfo, rotation: Int, width: Int, height: Int): String {
@@ -47,6 +54,8 @@ class UiHierarchy(private val uiAutomation: UiAutomation) {
         serializer.startDocument("UTF-8", true)
         serializer.startTag(NS, "hierarchy")
         serializer.attribute(NS, "rotation", rotation.toString())
+        serializer.attribute(NS, "width", width.toString())
+        serializer.attribute(NS, "height", height.toString())
         dumpNode(root, serializer, 0, width, height)
         serializer.endTag(NS, "hierarchy")
         serializer.endDocument()

@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.annotation.TargetApi
 import android.app.UiAutomation
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
 import android.view.InputDevice
@@ -12,6 +13,7 @@ import android.view.InputEvent
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -68,6 +70,10 @@ sealed class InputAction {
         val keyCodes: List<Int>,
         val metaState: Int = 0,
         val intervalMs: Long = 0L
+    ) : InputAction()
+    data class Text(
+        val text: String,
+        val clear: Boolean = false
     ) : InputAction()
     data class Global(val actionId: Int) : InputAction()
 }
@@ -354,6 +360,11 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
                                 allOk = false
                             }
                         }
+                        is InputAction.Text -> {
+                            if (!performTextLocked(action, finalSync)) {
+                                allOk = false
+                            }
+                        }
                         is InputAction.Global -> {
                             batchUsedUiAutomation = true
                             if (!uiAutomation.performGlobalAction(action.actionId)) {
@@ -509,6 +520,106 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
         return ok
     }
 
+    private fun performTextLocked(action: InputAction.Text, finalSync: Boolean): Boolean {
+        val chars = action.text.toCharArray()
+        val keyEvents: Array<KeyEvent>? = if (chars.isNotEmpty()) {
+            try {
+                KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD).getEvents(chars)
+            } catch (_: Throwable) {
+                null
+            }
+        } else {
+            emptyArray()
+        }
+
+        if (action.clear || keyEvents == null) {
+            if (trySetTextViaAccessibilityLocked(action.text, action.clear)) {
+                batchUsedUiAutomation = true
+                return true
+            }
+        }
+
+        var ok = true
+        if (action.clear) {
+            val selectAll = InputAction.Key(
+                keyCodes = listOf(KeyEvent.KEYCODE_A),
+                metaState = KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
+            )
+            val deleteKey = InputAction.Key(keyCodes = listOf(KeyEvent.KEYCODE_DEL))
+            if (!performKeyLocked(selectAll, false)) ok = false
+            if (!performKeyLocked(deleteKey, chars.isEmpty() && finalSync)) ok = false
+        }
+
+        if (chars.isEmpty()) {
+            return ok
+        }
+        val events = keyEvents ?: return false
+        for (index in events.indices) {
+            checkNotCancelled()
+            val isLast = index == events.lastIndex
+            if (!inject(events[index], isLast && finalSync)) {
+                ok = false
+            }
+        }
+        return ok
+    }
+
+    private fun trySetTextViaAccessibilityLocked(text: String, clear: Boolean): Boolean {
+        val focused: AccessibilityNodeInfo = findFocusedEditableNodeLocked() ?: return false
+        try {
+            val newText: String = if (clear || focused.isShowingHintText) {
+                text
+            } else {
+                val existing = focused.text?.toString() ?: ""
+                existing + text
+            }
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, newText)
+            }
+            return focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        } catch (_: Throwable) {
+            return false
+        } finally {
+            try { focused.recycle() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun findFocusedEditableNodeLocked(): AccessibilityNodeInfo? {
+        try {
+            val directFocus = uiAutomation.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (directFocus != null) {
+                if (directFocus.isEditable) {
+                    return directFocus
+                }
+                directFocus.recycle()
+            }
+        } catch (_: Throwable) {
+        }
+        val root = try {
+            uiAutomation.rootInActiveWindow
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        return findFocusedEditableInSubtree(root)
+    }
+
+    private fun findFocusedEditableInSubtree(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        if (node.isEditable && node.isFocused) {
+            return node
+        }
+        val count = node.childCount
+        for (i in 0 until count) {
+            val child = node.getChild(i) ?: continue
+            val match = findFocusedEditableInSubtree(child)
+            if (match != null) {
+                node.recycle()
+                return match
+            }
+        }
+        node.recycle()
+        return null
+    }
+
     private fun injectMotion(
         downTime: Long,
         eventTime: Long,
@@ -571,6 +682,7 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
         private const val MIN_STEPS: Int = 1
         private const val MAX_STEPS: Int = 300
         private const val MAX_KEY_CODES: Int = 64
+        private const val MAX_TEXT_LENGTH: Int = 4096
         private const val MAX_BATCH_ACTIONS: Int = 256
         private const val SLEEP_SLICE_MS: Long = 50L
 
@@ -610,6 +722,14 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
             validateRange(intervalMs, 0L, MAX_DURATION_MS, "intervalMs")
             val sync = optionalBoolean(json, request.query, "sync") ?: true
             return InputCommand(InputAction.Key(keyCodes, metaState, intervalMs), sync)
+        }
+
+        fun parseText(request: HttpRequest): InputCommand {
+            val json = parseOptionalJsonObject(request)
+            val clear = optionalBoolean(json, request.query, "clear") ?: false
+            val text = extractTextValue(json, request.query, clear)
+            val sync = optionalBoolean(json, request.query, "sync") ?: true
+            return InputCommand(InputAction.Text(text, clear), sync)
         }
 
         fun parseGlobal(request: HttpRequest): InputCommand {
@@ -666,7 +786,7 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
                         touchDown = false
                     }
                     is InputAction.Tap, is InputAction.Swipe -> touchDown = false
-                    is InputAction.Wait, is InputAction.Key, is InputAction.Global -> Unit
+                    is InputAction.Wait, is InputAction.Key, is InputAction.Text, is InputAction.Global -> Unit
                 }
                 parsed.add(action)
             }
@@ -731,6 +851,11 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
                     val intervalMs = optionalLong(obj, emptyMap(), "interval", "intervalMs") ?: 0L
                     validateRange(intervalMs, 0L, MAX_DURATION_MS, "intervalMs")
                     InputAction.Key(codes, metaState, intervalMs)
+                }
+                "text" -> {
+                    val clear = optionalBoolean(obj, emptyMap(), "clear") ?: false
+                    val text = extractTextValue(obj, emptyMap(), clear)
+                    InputAction.Text(text, clear)
                 }
                 "global" -> {
                     val raw = extractGlobalActionRaw(obj, emptyMap())
@@ -935,6 +1060,34 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
                 throw BadRequestException("keyCodes count must be in 1..$MAX_KEY_CODES")
             }
             return codes
+        }
+
+        private fun extractTextValue(
+            json: JSONObject?,
+            query: Map<String, String>,
+            clear: Boolean
+        ): String {
+            var value: String? = null
+            if (json != null && json.has("text") && !json.isNull("text")) {
+                val raw = json.get("text")
+                if (raw !is String) {
+                    throw BadRequestException("invalid text parameter: expected string")
+                }
+                value = raw
+            } else if (query.containsKey("text")) {
+                value = query["text"]
+            }
+            if (value == null) {
+                if (clear) return ""
+                throw BadRequestException("missing text parameter")
+            }
+            if (value.isEmpty() && !clear) {
+                throw BadRequestException("text cannot be empty unless clear=true")
+            }
+            if (value.length > MAX_TEXT_LENGTH) {
+                throw BadRequestException("text length exceeds maximum $MAX_TEXT_LENGTH")
+            }
+            return value
         }
 
         private fun extractGlobalActionRaw(json: JSONObject?, query: Map<String, String>): String {

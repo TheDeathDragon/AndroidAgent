@@ -223,6 +223,7 @@ class SimpleHttpServer(
             "/input/tap" -> handleInputTap(request)
             "/input/swipe" -> handleInputSwipe(request)
             "/input/key" -> handleInputKey(request)
+            "/input/text" -> handleInputText(request)
             "/input/global" -> handleInputGlobal(request)
             "/input/batch" -> handleInputBatch(request)
             else -> HttpResponse.text(HttpStatus.NOT_FOUND, "not found: ${request.path}")
@@ -354,6 +355,11 @@ class SimpleHttpServer(
 
     private fun handleInputKey(request: HttpRequest): HttpResponse {
         val command = InputController.parseKey(request)
+        return inputResultResponse(inputController.execute(command))
+    }
+
+    private fun handleInputText(request: HttpRequest): HttpResponse {
+        val command = InputController.parseText(request)
         return inputResultResponse(inputController.execute(command))
     }
 
