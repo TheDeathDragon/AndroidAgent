@@ -78,6 +78,36 @@ All endpoints support HTTP/1.1 Keep-Alive (up to 1000 requests per connection, 1
 - `fast`: `true` or `false` (default `false`); uses a persistent `VirtualDisplay` mirror when supported and falls back to `UiAutomation.takeScreenshot()` otherwise
 - Response headers: `X-Width`, `X-Height`, `X-Format`, `X-Capture-Source` (`virtual-display` or `uiautomation`)
 
+## AXI CLI & Agent Skill
+
+`cli/` ships a zero-dependency Python 3.10+ CLI (`android-agent`) that wraps every AndroidAgent endpoint with TOON output, persistent HTTP/1.1 Keep-Alive, strict validation, and idempotent lifecycle commands (`start`, `stop`, `screen`, `ui`, `tap`, `swipe`, `key`, `global`, `batch`, `packages`, `package`, `signature`, `icon`, `device`).
+
+```sh
+pip install -e ./cli        # installs `android-agent` on PATH
+android-agent start
+android-agent ui
+android-agent tap --text Settings
+```
+
+You can also run directly without installing:
+
+```sh
+python cli/android_agent.py status
+```
+
+### Connect to Coding Agents (choose either path)
+
+You only need one of the two integrations below (or install both if you want live session context plus on-demand discovery):
+
+1. **Session hook (recommended)**: injects compact live device/agent state at every session start in Claude Code, Codex, and OpenCode.
+   ```sh
+   android-agent setup
+   ```
+2. **Installable Agent Skill**: zero per-session token cost, loads on demand in any Agent Skills-compatible harness from [`skills/android-agent/SKILL.md`](skills/android-agent/SKILL.md).
+   ```sh
+   npx skills add TheDeathDragon/AndroidAgent --skill android-agent
+   ```
+
 ## Notes
 
 - `UiAutomation` is a per-device singleton. A second agent on the same device

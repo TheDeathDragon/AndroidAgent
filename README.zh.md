@@ -77,6 +77,36 @@ curl http://127.0.0.1:9500/health
 - `fast`: `true` 或 `false` (默认 `false`); 开启后优先走常驻 `VirtualDisplay` 镜像, 不支持或首帧未就绪时自动回退至 `UiAutomation.takeScreenshot()`
 - 响应头: `X-Width`、`X-Height`、`X-Format`、`X-Capture-Source` (`virtual-display` 或 `uiautomation`)
 
+## AXI 命令行工具与 Agent Skill
+
+`cli/` 提供了零外部依赖的 Python 3.10+ 命令行工具 (`android-agent`)，以 TOON 输出、HTTP/1.1 Keep-Alive 连接复用、严格参数校验和幂等启停封装了所有 AndroidAgent 接口（`start`、`stop`、`screen`、`ui`、`tap`、`swipe`、`key`、`global`、`batch`、`packages`、`package`、`signature`、`icon`、`device`）。
+
+```sh
+pip install -e ./cli        # 将 `android-agent` 安装到 PATH
+android-agent start
+android-agent ui
+android-agent tap --text Settings
+```
+
+也可无需安装直接运行：
+
+```sh
+python cli/android_agent.py status
+```
+
+### 接入 Coding Agent（二选一即可）
+
+以下两种接入方式任选其一即可（也可同时安装以兼得会话启动实时状态与按需加载）：
+
+1. **Session Hook（推荐）**：在 Claude Code、Codex 与 OpenCode 会话启动时自动注入精简设备/服务状态。
+   ```sh
+   android-agent setup
+   ```
+2. **可安装 Agent Skill**：无常驻会话 token 开销，支持任意兼容 Agent Skills 格式的客户端按需加载 [`skills/android-agent/SKILL.md`](skills/android-agent/SKILL.md)。
+   ```sh
+   npx skills add TheDeathDragon/AndroidAgent --skill android-agent
+   ```
+
 ## 注意
 
 - `UiAutomation` 是设备级单例。同一台设备上跑第二份 agent 会报
