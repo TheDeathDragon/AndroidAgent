@@ -355,11 +355,25 @@ def handle_screen(inv: ParsedInvocation) -> dict[str, Any]:
         "source": source,
         "bytes": len(res.body),
     }
+    if crop is not None:
+        payload["crop"] = crop
     if cache_hit:
         payload["cache_hit"] = True
-    if scale < 1.0:
+    if crop is not None:
+        crop_x, crop_y = (int(v) for v in crop.split(",")[:2])
+        if scale < 1.0:
+            payload["coords_note"] = (
+                f"Image cropped at ({crop_x},{crop_y}) after scaling by {scale:g}; "
+                f"convert pixel (px,py) to native via ((px+{crop_x})/{scale:g}, (py+{crop_y})/{scale:g})"
+            )
+        else:
+            payload["coords_note"] = (
+                f"Image cropped at ({crop_x},{crop_y}); "
+                f"add ({crop_x},{crop_y}) to pixel coordinates for native tap/swipe"
+            )
+    elif scale < 1.0:
         native_hint = ""
-        if crop is None and width > 0 and height > 0:
+        if width > 0 and height > 0:
             est_w = round(width / scale)
             est_h = round(height / scale)
             native_hint = f" (approx {est_w}x{est_h} native)"
@@ -492,12 +506,15 @@ def handle_tap(inv: ParsedInvocation) -> dict[str, Any]:
         y = _parse_finite_float(pos[1], "y")
         with _make_client(inv.globals) as client:
             resp = client.post_tap(x, y, duration_ms=duration, sync=sync)
-        return {
+        payload_xy: dict[str, Any] = {
             "ok": bool(resp.get("ok", False)),
             "x": x,
             "y": y,
             "durationMs": duration,
         }
+        if resp.get("source"):
+            payload_xy["source"] = resp["source"]
+        return payload_xy
 
     with _make_client(inv.globals) as client:
         xml_text = client.get_hierarchy(compressed=True)
@@ -534,7 +551,7 @@ def handle_tap(inv: ParsedInvocation) -> dict[str, Any]:
         chosen = targets[chosen_idx]
         resp = client.post_tap(float(chosen.cx), float(chosen.cy), duration_ms=duration, sync=sync)
 
-    return {
+    payload_sel: dict[str, Any] = {
         "ok": bool(resp.get("ok", False)),
         "x": chosen.cx,
         "y": chosen.cy,
@@ -542,6 +559,9 @@ def handle_tap(inv: ParsedInvocation) -> dict[str, Any]:
         "res_id": chosen.res_id or "-",
         "durationMs": duration,
     }
+    if resp.get("source"):
+        payload_sel["source"] = resp["source"]
+    return payload_sel
 
 
 def _selector_desc(text: str | None, res_id: str | None, query: str | None) -> str:
@@ -656,6 +676,8 @@ def handle_swipe(inv: ParsedInvocation) -> dict[str, Any]:
     }
     if direction is not None:
         result["direction"] = direction
+    if resp.get("source"):
+        result["source"] = resp["source"]
     return result
 
 
@@ -709,11 +731,14 @@ def handle_key(inv: ParsedInvocation) -> dict[str, Any]:
 
     with _make_client(inv.globals) as client:
         resp = client.post_key(codes, meta_state=meta, interval_ms=interval, sync=sync)
-    return {
+    result: dict[str, Any] = {
         "ok": bool(resp.get("ok", False)),
         "keyCodes": codes,
         "count": len(codes),
     }
+    if resp.get("source"):
+        result["source"] = resp["source"]
+    return result
 
 
 def _validate_global_action(raw: str) -> str | int:
@@ -908,11 +933,14 @@ def handle_batch(inv: ParsedInvocation) -> dict[str, Any]:
     actions, sync = validate_batch_payload(raw_text, sync_override=sync_override)
     with _make_client(inv.globals, timeout=30.0) as client:
         resp = client.post_batch(actions, sync=sync)
-    return {
+    result: dict[str, Any] = {
         "ok": bool(resp.get("ok", False)),
         "actions": len(actions),
         "sync": sync,
     }
+    if resp.get("source"):
+        result["source"] = resp["source"]
+    return result
 
 
 def handle_packages(inv: ParsedInvocation) -> dict[str, Any]:

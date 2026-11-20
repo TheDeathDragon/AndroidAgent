@@ -89,7 +89,7 @@ Usage: `android-agent screen [--out PATH] [--format jpeg|png|rgba] [--quality 1.
 - `--quality INT`: Compression quality 1..100 (default: 80 for jpeg, 100 for png/rgba)
 - `--scale FLOAT`: Downscale factor 0.1..1.0 (default: 0.5)
 - `--crop X,Y,W,H`: Crop region in scaled image pixels: x,y,w,h (x>=0, y>=0, w>0, h>0)
-- `--fast/--no-fast`: Use VirtualDisplay mirror when available (default: --fast)
+- `--fast/--no-fast`: Use VirtualDisplay mirror when available on Android 10+ (default: --fast)
 
 ```sh
 android-agent screen
@@ -135,10 +135,11 @@ Usage: `android-agent tap (<x> <y> | --text STR | --id STR | --query STR) [--exa
 - `--exact`: Require exact case-insensitive match for selector
 - `--index N`: Disambiguate multi-match selector by 0-based index
 - `--duration MS`: Hold duration in ms for long-press (0..30000, default: 0)
-- `--no-sync`: Inject asynchronously (sync=false)
+- `--no-sync`: Inject asynchronously (sync=false, fire-and-forget for lowest latency)
 
 ```sh
 android-agent tap 540 1200
+android-agent tap 540 1200 --no-sync
 android-agent tap --text Settings
 android-agent tap --id search_bar --duration 600
 ```
@@ -153,7 +154,7 @@ Usage: `android-agent swipe (<x1> <y1> <x2> <y2> | up|down|left|right) [--distan
 - `--duration MS`: Swipe duration in ms (0..30000, default: 300)
 - `--steps N`: Interpolation step count (1..300)
 - `--hold MS`: Hold at end position before release (0..10000, default: 0)
-- `--no-sync`: Inject asynchronously (sync=false)
+- `--no-sync`: Inject asynchronously (sync=false, fire-and-forget for lowest latency)
 
 ```sh
 android-agent swipe up
@@ -169,7 +170,7 @@ Usage: `android-agent key <codes> [--meta 0] [--interval 0] [--no-sync]`
 
 - `--meta INT`: KeyEvent meta state bitmask (default: 0)
 - `--interval MS`: Delay between batched keys in ms (0..30000, default: 0)
-- `--no-sync`: Inject asynchronously (sync=false)
+- `--no-sync`: Inject asynchronously (sync=false, fire-and-forget for lowest latency)
 
 ```sh
 android-agent key enter
@@ -196,7 +197,7 @@ Validate and execute a JSON gesture/input action sequence via /input/batch.
 Usage: `android-agent batch [<json>] [--file PATH|-] [--no-sync]`
 
 - `--file PATH`: Read JSON payload from file or '-' for stdin
-- `--no-sync`: Inject asynchronously (sync=false)
+- `--no-sync`: Inject asynchronously (sync=false, fire-and-forget for lowest latency)
 
 ```sh
 android-agent batch '[{"type":"tap","x":540,"y":1200},{"type":"wait","durationMs":200}]'
@@ -307,8 +308,9 @@ android-agent skill --check
 
 ## Notes
 
-- `start` and `stop` are idempotent and exit 0 when already in the target state.
-- `screen` defaults to `--fast --format jpeg --quality 80 --scale 0.5` and saves the image to a file; tap and swipe coordinates always use native screen pixels.
+- `start` and `stop` are idempotent and exit 0 when already in the target state; `start` verifies the on-device JAR by SHA-256 before skipping push.
+- `screen` defaults to `--fast --format jpeg --quality 80 --scale 0.5` (Android 10+ VirtualDisplay mirror, with `frameVersion` encoding cache reported as `cache_hit: true` when the frame is unchanged); `--crop X,Y,W,H` uses scaled image pixels, while `tap` and `swipe` always use native screen pixels.
+- `tap`, `swipe`, `key`, and `batch` use direct `InputManager` injection (`source: direct`) with automatic `UiAutomation` fallback (`source: uiautomation`); pass `--no-sync` for lowest-latency fire-and-forget actions.
 - `tap --text/--id/--query` finds and taps a UI element over one Keep-Alive connection, walking up to clickable ancestors and returning an inline candidate table on ambiguous matches.
 - `ui` defaults to interactive nodes with container label hoisting; pass `--all` for every node or `--xml` for raw hierarchy XML.
 - Run `android-agent setup` to install ambient `SessionStart` hooks for Claude Code, Codex, and OpenCode.

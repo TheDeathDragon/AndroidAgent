@@ -208,7 +208,8 @@ class _MockAgentHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         payload = json.loads(body.decode("utf-8")) if body else None
         self.server.requests.append(("POST", parsed.path, payload))
-        self._send(200, b'{"ok":true}', "application/json")
+        extra = {"X-Input-Source": "direct"} if parsed.path in ("/input/tap", "/input/swipe", "/input/key", "/input/batch") else None
+        self._send(200, b'{"ok":true}', "application/json", extra)
 
 
 class TestCommandsMock(unittest.TestCase):
@@ -276,10 +277,19 @@ class TestCommandsMock(unittest.TestCase):
             self.assertTrue(out_file.is_file())
             self.assertIn("width: 200", out)
             self.assertIn("height: 300", out)
+            self.assertIn('crop: "10,20,200,300"', out)
             self.assertIn("cache_hit: true", out)
+            self.assertIn("(px+10)/0.5", out)
             method, path, query = self.srv.requests[-1]
             self.assertEqual((method, path), ("GET", "/screenshot"))
             self.assertEqual(query.get("crop"), "10,20,200,300")
+
+            out_full = Path(tmp) / "crop_full.jpg"
+            code_f, out_f, err_f = self._run(["screen", "--scale", "1.0", "--crop", "50,60,200,300", "--out", str(out_full)])
+            self.assertEqual(code_f, 0)
+            self.assertEqual(err_f, "")
+            self.assertIn('crop: "50,60,200,300"', out_f)
+            self.assertIn("add (50,60)", out_f)
 
     def test_ui_table_xml_truncation_and_empty_state(self) -> None:
         code, out, _ = self._run(["ui"])
@@ -310,6 +320,12 @@ class TestCommandsMock(unittest.TestCase):
         self.assertEqual(self.srv.connection_count - before_conns, 1)
         self.assertIn("x: 540", out)
         self.assertIn("y: 280", out)
+        self.assertIn("source: direct", out)
+
+        code_xy, out_xy, _ = self._run(["tap", "100", "200", "--no-sync"])
+        self.assertEqual(code_xy, 0)
+        self.assertIn("source: direct", out_xy)
+        self.assertEqual(self.srv.requests[-1][2]["sync"], False)
 
         # Ambiguous selector exits 1 with inline candidates table and does not POST tap.
         req_count_before = len(self.srv.requests)
@@ -344,6 +360,7 @@ class TestCommandsMock(unittest.TestCase):
         code_k, out_k, _ = self._run(["key", "enter,back,KEYCODE_SPACE,66"])
         self.assertEqual(code_k, 0)
         self.assertIn("keyCodes[4]: 66,4,KEYCODE_SPACE,66", out_k)
+        self.assertIn("source: direct", out_k)
 
         code_g, out_g, _ = self._run(["global", "home"])
         self.assertEqual(code_g, 0)
@@ -366,6 +383,7 @@ class TestCommandsMock(unittest.TestCase):
         code_ok, out_ok, _ = self._run(["batch", valid_batch])
         self.assertEqual(code_ok, 0)
         self.assertIn("actions: 3", out_ok)
+        self.assertIn("source: direct", out_ok)
 
     def test_packages_package_signature_icon_and_device(self) -> None:
         code_p, out_p, _ = self._run(["packages"])
@@ -416,6 +434,35 @@ class TestCommandsMock(unittest.TestCase):
             code_d, out_d, _ = self._run(["devices"])
             self.assertEqual(code_d, 0)
             self.assertIn("count: 1 connected", out_d)
+
+    def test_adb_find_sdk_fallback_and_push_jar_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sdk_root = Path(tmp) / "sdk"
+            pt = sdk_root / "platform-tools"
+            pt.mkdir(parents=True)
+            adb_exe = pt / ("adb.exe" if sys.platform == "win32" else "adb")
+            adb_exe.write_bytes(b"stub")
+
+            with mock.patch("android_agent_cli.adb.shutil.which", return_value=None), mock.patch.dict(
+                "os.environ", {"ANDROID_HOME": str(sdk_root)}, clear=False
+            ):
+                self.assertEqual(adb.find_adb(), str(adb_exe))
+
+            jar = Path(tmp) / "agent-server.jar"
+            jar.write_bytes(b"same-len-new-jar")
+            expected_sha = adb._local_file_sha256(jar)
+
+            with mock.patch("android_agent_cli.adb.remote_file_sha256", return_value=expected_sha), mock.patch(
+                "android_agent_cli.adb.run_adb"
+            ) as mock_run:
+                self.assertFalse(adb.push_jar("SER1", jar))
+                mock_run.assert_not_called()
+
+            with mock.patch("android_agent_cli.adb.remote_file_sha256", return_value="0" * 64), mock.patch(
+                "android_agent_cli.adb.run_adb"
+            ) as mock_run:
+                self.assertTrue(adb.push_jar("SER1", jar))
+                mock_run.assert_called_once()
 
 
 if __name__ == "__main__":

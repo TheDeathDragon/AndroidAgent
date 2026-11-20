@@ -191,13 +191,24 @@ class AgentClient:
             params=params,
         )
 
+    @staticmethod
+    def _parse_input_response(res: HttpResult) -> dict[str, Any]:
+        raw = res.json()
+        data = dict(raw) if isinstance(raw, dict) else {"ok": bool(raw)}
+        source = res.headers.get("x-input-source", "").strip()
+        if source:
+            data["source"] = source
+        return data
+
     def post_tap(self, x: float, y: float, duration_ms: int = 0, sync: bool = True) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/input/tap",
-            json_body={"x": x, "y": y, "durationMs": duration_ms, "sync": sync},
-            retry_on_reset=False,
-        ).json()
+        return self._parse_input_response(
+            self.request(
+                "POST",
+                "/input/tap",
+                json_body={"x": x, "y": y, "durationMs": duration_ms, "sync": sync},
+                retry_on_reset=False,
+            )
+        )
 
     def post_swipe(
         self,
@@ -221,7 +232,9 @@ class AgentClient:
         }
         if steps is not None:
             payload["steps"] = steps
-        return self.request("POST", "/input/swipe", json_body=payload, retry_on_reset=False).json()
+        return self._parse_input_response(
+            self.request("POST", "/input/swipe", json_body=payload, retry_on_reset=False)
+        )
 
     def post_key(
         self,
@@ -230,17 +243,19 @@ class AgentClient:
         interval_ms: int = 0,
         sync: bool = True,
     ) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/input/key",
-            json_body={
-                "keyCodes": key_codes,
-                "metaState": meta_state,
-                "intervalMs": interval_ms,
-                "sync": sync,
-            },
-            retry_on_reset=False,
-        ).json()
+        return self._parse_input_response(
+            self.request(
+                "POST",
+                "/input/key",
+                json_body={
+                    "keyCodes": key_codes,
+                    "metaState": meta_state,
+                    "intervalMs": interval_ms,
+                    "sync": sync,
+                },
+                retry_on_reset=False,
+            )
+        )
 
     def post_global(self, action: str | int) -> dict[str, Any]:
         return self.request(
@@ -251,12 +266,14 @@ class AgentClient:
         ).json()
 
     def post_batch(self, actions: list[dict[str, Any]], sync: bool = True) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/input/batch",
-            json_body={"actions": actions, "sync": sync},
-            retry_on_reset=False,
-        ).json()
+        return self._parse_input_response(
+            self.request(
+                "POST",
+                "/input/batch",
+                json_body={"actions": actions, "sync": sync},
+                retry_on_reset=False,
+            )
+        )
 
     def get_packages(self, user_only: bool = False) -> list[dict[str, Any]]:
         val = "true" if user_only else "false"

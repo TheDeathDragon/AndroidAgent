@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -32,12 +33,20 @@ class AdbDevice:
 
 def find_adb() -> str:
     adb_path = shutil.which("adb")
-    if not adb_path:
-        raise RuntimeAxiError(
-            "adb executable not found on PATH",
-            help_hints=["Install Android Platform-Tools and ensure `adb` is on PATH"],
-        )
-    return adb_path
+    if adb_path:
+        return adb_path
+    exe_name = "adb.exe" if os.name == "nt" else "adb"
+    for env_key in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        sdk_root = os.environ.get(env_key)
+        if not sdk_root:
+            continue
+        candidate = Path(sdk_root).expanduser() / "platform-tools" / exe_name
+        if candidate.is_file():
+            return str(candidate)
+    raise RuntimeAxiError(
+        "adb executable not found on PATH or in ANDROID_HOME/platform-tools",
+        help_hints=["Install Android Platform-Tools and set ANDROID_HOME or add platform-tools to PATH"],
+    )
 
 
 def run_adb(
@@ -197,10 +206,41 @@ def remote_file_size(serial: str, remote_path: str = REMOTE_JAR_PATH) -> int | N
         return None
 
 
+def remote_file_sha256(serial: str, remote_path: str = REMOTE_JAR_PATH) -> str | None:
+    proc = run_adb(
+        ["shell", f"sha256sum {remote_path} 2>/dev/null"],
+        serial=serial,
+        timeout=5.0,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    parts = proc.stdout.strip().split()
+    if not parts:
+        return None
+    digest = parts[0].lower()
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        return None
+    return digest
+
+
+def _local_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def push_jar(serial: str, local_jar: Path, remote_path: str = REMOTE_JAR_PATH) -> bool:
-    local_size = local_jar.stat().st_size
-    if remote_file_size(serial, remote_path) == local_size:
-        return False
+    remote_sha = remote_file_sha256(serial, remote_path)
+    if remote_sha is not None:
+        if remote_sha == _local_file_sha256(local_jar):
+            return False
+    else:
+        local_size = local_jar.stat().st_size
+        if remote_file_size(serial, remote_path) == local_size:
+            return False
     run_adb(["push", str(local_jar), remote_path], serial=serial, timeout=30.0)
     return True
 

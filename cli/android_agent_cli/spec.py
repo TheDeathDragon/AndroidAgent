@@ -252,7 +252,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
             FlagSpec("quality", "--quality", kind="int", default=None, value_name="INT", description="Compression quality 1..100 (default: 80 for jpeg, 100 for png/rgba)", min_val=1, max_val=100),
             FlagSpec("scale", "--scale", kind="float", default=0.5, value_name="FLOAT", description="Downscale factor 0.1..1.0 (default: 0.5)", min_val=0.1, max_val=1.0),
             FlagSpec("crop", "--crop", kind="str", default=None, value_name="X,Y,W,H", description="Crop region in scaled image pixels: x,y,w,h (x>=0, y>=0, w>0, h>0)"),
-            FlagSpec("fast", "--fast", negated="--no-fast", kind="bool", default=True, description="Use VirtualDisplay mirror when available (default: --fast)"),
+            FlagSpec("fast", "--fast", negated="--no-fast", kind="bool", default=True, description="Use VirtualDisplay mirror when available on Android 10+ (default: --fast)"),
         ),
         renamed_flags={
             "--output": ("--out", "--output is not used; use --out PATH instead"),
@@ -308,13 +308,14 @@ COMMANDS: tuple[CommandSpec, ...] = (
             FlagSpec("exact", "--exact", kind="bool", default=False, description="Require exact case-insensitive match for selector"),
             FlagSpec("index", "--index", kind="int", default=None, value_name="N", description="Disambiguate multi-match selector by 0-based index", min_val=0),
             FlagSpec("duration", "--duration", kind="int", default=0, value_name="MS", description="Hold duration in ms for long-press (0..30000, default: 0)", min_val=0, max_val=30000),
-            FlagSpec("no_sync", "--no-sync", kind="bool", default=False, description="Inject asynchronously (sync=false)"),
+            FlagSpec("no_sync", "--no-sync", kind="bool", default=False, description="Inject asynchronously (sync=false, fire-and-forget for lowest latency)"),
         ),
         renamed_flags={
             "--durationMs": ("--duration", "use --duration MS instead of --durationMs"),
         },
         examples=(
             "android-agent tap 540 1200",
+            "android-agent tap 540 1200 --no-sync",
             "android-agent tap --text Settings",
             "android-agent tap --id search_bar --duration 600",
         ),
@@ -334,7 +335,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
             FlagSpec("duration", "--duration", kind="int", default=300, value_name="MS", description="Swipe duration in ms (0..30000, default: 300)", min_val=0, max_val=30000),
             FlagSpec("steps", "--steps", kind="int", default=None, value_name="N", description="Interpolation step count (1..300)", min_val=1, max_val=300),
             FlagSpec("hold", "--hold", kind="int", default=0, value_name="MS", description="Hold at end position before release (0..10000, default: 0)", min_val=0, max_val=10000),
-            FlagSpec("no_sync", "--no-sync", kind="bool", default=False, description="Inject asynchronously (sync=false)"),
+            FlagSpec("no_sync", "--no-sync", kind="bool", default=False, description="Inject asynchronously (sync=false, fire-and-forget for lowest latency)"),
         ),
         renamed_flags={
             "--durationMs": ("--duration", "use --duration MS instead of --durationMs"),
@@ -359,7 +360,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         flags=(
             FlagSpec("meta", "--meta", kind="int", default=0, value_name="INT", description="KeyEvent meta state bitmask (default: 0)", min_val=0),
             FlagSpec("interval", "--interval", kind="int", default=0, value_name="MS", description="Delay between batched keys in ms (0..30000, default: 0)", min_val=0, max_val=30000),
-            FlagSpec("no_sync", "--no-sync", kind="bool", default=False, description="Inject asynchronously (sync=false)"),
+            FlagSpec("no_sync", "--no-sync", kind="bool", default=False, description="Inject asynchronously (sync=false, fire-and-forget for lowest latency)"),
         ),
         renamed_flags={
             "--metaState": ("--meta", "use --meta INT instead of --metaState"),
@@ -397,7 +398,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         ),
         flags=(
             FlagSpec("file", "--file", kind="str", default=None, value_name="PATH", description="Read JSON payload from file or '-' for stdin"),
-            FlagSpec("no_sync", "--no-sync", kind="bool", default=False, description="Inject asynchronously (sync=false)"),
+            FlagSpec("no_sync", "--no-sync", kind="bool", default=False, description="Inject asynchronously (sync=false, fire-and-forget for lowest latency)"),
         ),
         examples=(
             "android-agent batch '[{\"type\":\"tap\",\"x\":540,\"y\":1200},{\"type\":\"wait\",\"durationMs\":200}]'",
@@ -668,8 +669,9 @@ def render_skill_md() -> str:
     lines.extend([
         "## Notes",
         "",
-        "- `start` and `stop` are idempotent and exit 0 when already in the target state.",
-        "- `screen` defaults to `--fast --format jpeg --quality 80 --scale 0.5` and saves the image to a file; tap and swipe coordinates always use native screen pixels.",
+        "- `start` and `stop` are idempotent and exit 0 when already in the target state; `start` verifies the on-device JAR by SHA-256 before skipping push.",
+        "- `screen` defaults to `--fast --format jpeg --quality 80 --scale 0.5` (Android 10+ VirtualDisplay mirror, with `frameVersion` encoding cache reported as `cache_hit: true` when the frame is unchanged); `--crop X,Y,W,H` uses scaled image pixels, while `tap` and `swipe` always use native screen pixels.",
+        "- `tap`, `swipe`, `key`, and `batch` use direct `InputManager` injection (`source: direct`) with automatic `UiAutomation` fallback (`source: uiautomation`); pass `--no-sync` for lowest-latency fire-and-forget actions.",
         "- `tap --text/--id/--query` finds and taps a UI element over one Keep-Alive connection, walking up to clickable ancestors and returning an inline candidate table on ambiguous matches.",
         "- `ui` defaults to interactive nodes with container label hoisting; pass `--all` for every node or `--xml` for raw hierarchy XML.",
         "- Run `android-agent setup` to install ambient `SessionStart` hooks for Claude Code, Codex, and OpenCode.",
