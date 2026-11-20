@@ -10,11 +10,12 @@
 
 ## 特性
 
-- `/screenshot` 走 `UiAutomation.takeScreenshot()` —— 比 `screencap` 快约 3×
-- `/hierarchy` 走 `AccessibilityNodeInfo` 遍历 —— 比 `uiautomator dump` 快约 10×
+- `/screenshot` 支持 `UiAutomation.takeScreenshot()` 与常驻 `VirtualDisplay` 镜像 (`fast=true`), 支持 PNG/JPEG/RGBA 输出与缩放
+- `/input/*` 通过 `UiAutomation.injectInputEvent()` 实现低延迟点击、滑动、按键、全局操作与批量手势注入
+- `/hierarchy` 走 `AccessibilityNodeInfo` 遍历 (比 `uiautomator dump` 快约 10x)
 - `/packages`、`/icon`、`/signature`、`/device-info` 由 `PackageManager` + `dumpsys` 提供
-- 仅监听 127.0.0.1，必须通过 `adb forward` 才能访问
-- 零外部依赖，R8 压缩后 ~92 KB
+- 支持 HTTP/1.1 Keep-Alive, 仅监听 `127.0.0.1`, 必须通过 `adb forward` 访问
+- 零外部依赖, 独立 DEX JAR, 供 `app_process` 直接运行
 
 ## 构建
 
@@ -49,17 +50,32 @@ curl http://127.0.0.1:9500/health
 
 ## 接口
 
-| Method | Path                          | 返回                                 |
-|--------|-------------------------------|--------------------------------------|
-| GET    | `/health`                     | 文本 `ok`                            |
-| GET    | `/hierarchy?compressed=true`  | `application/xml`                    |
-| GET    | `/screenshot?quality=100`     | `image/png`                          |
-| GET    | `/packages?user_only=false`   | JSON 数组                             |
-| GET    | `/icon?pkg=<name>`            | `image/png`                          |
-| GET    | `/signature?pkg=<name>`       | 文本 —— V1/V2/V3/V4 签名方案          |
-| GET    | `/device-info`                | JSON —— 14 段设备画像                 |
-| GET    | `/info`                       | JSON —— brand/model/sdk/version      |
-| GET    | `/stop`                       | 文本 `stopping` —— 优雅关停           |
+所有接口均支持 HTTP/1.1 Keep-Alive (单连接最多 1000 次请求, 空闲超时 15 秒)。
+
+| Method   | Path                          | 返回 / 说明                                                       |
+|----------|-------------------------------|-------------------------------------------------------------------|
+| GET      | `/health`                     | 文本 `ok`                                                         |
+| GET      | `/hierarchy?compressed=true`  | `application/xml`                                                 |
+| GET      | `/screenshot`                 | `image/png`、`image/jpeg` 或 `application/octet-stream` (原始 RGBA) |
+| GET/POST | `/input/tap`                  | JSON `{"ok":true}` (查询参数或 JSON: `x`, `y`, `durationMs`, `sync`) |
+| GET/POST | `/input/swipe`                | JSON `{"ok":true}` (查询参数或 JSON: `x1`, `y1`, `x2`, `y2`, `durationMs`, `steps`, `holdMs`, `sync`) |
+| GET/POST | `/input/key`                  | JSON `{"ok":true}` (查询参数或 JSON: `keyCode`/`keyCodes`, `metaState`, `intervalMs`, `sync`) |
+| GET/POST | `/input/global`               | JSON `{"ok":true}` (`action`: `back`, `home`, `recents`, `notifications`, `quick_settings`, `power_dialog`, `lock_screen`, `screenshot` 或数字 ID) |
+| POST     | `/input/batch`                | JSON `{"ok":true}` (JSON 请求体 `{"actions":[...],"sync":true}` 或 `[...]`; 支持 `down`/`move`/`up`/`tap`/`swipe`/`wait`/`key`/`global`) |
+| GET      | `/packages?user_only=false`   | JSON 数组                                                         |
+| GET      | `/icon?pkg=<name>`            | `image/png`                                                       |
+| GET      | `/signature?pkg=<name>`       | 文本 (V1/V2/V3/V4 签名方案)                                       |
+| GET      | `/device-info`                | JSON (14 段设备画像)                                              |
+| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`version`)                            |
+| GET      | `/stop`                       | 文本 `stopping` (优雅关停)                                        |
+
+### `/screenshot` 参数与响应头
+
+- `format`: `png` (默认, 质量 100)、`jpeg`/`jpg` (默认质量 80) 或 `rgba` (紧密排列的 `RGBA_8888` 原始字节)
+- `quality`: 整数 `1..100`
+- `scale`: 浮点数 `0.1..1.0` (默认 `1.0`)
+- `fast`: `true` 或 `false` (默认 `false`); 开启后优先走常驻 `VirtualDisplay` 镜像, 不支持或首帧未就绪时自动回退至 `UiAutomation.takeScreenshot()`
+- 响应头: `X-Width`、`X-Height`、`X-Format`、`X-Capture-Source` (`virtual-display` 或 `uiautomation`)
 
 ## 注意
 

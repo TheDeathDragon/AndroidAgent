@@ -10,11 +10,12 @@ install, no permissions beyond `shell` uid.
 
 ## Features
 
-- `/screenshot` via `UiAutomation.takeScreenshot()` — ~3× faster than `screencap`
-- `/hierarchy` via `AccessibilityNodeInfo` walk — ~10× faster than `uiautomator dump`
+- `/screenshot` via `UiAutomation.takeScreenshot()` or persistent `VirtualDisplay` mirror (`fast=true`) with PNG, JPEG, and raw RGBA output plus optional downscaling
+- `/input/*` low-latency touch, swipe, key, global action, and batched gesture injection via `UiAutomation.injectInputEvent()`
+- `/hierarchy` via `AccessibilityNodeInfo` walk (~10x faster than `uiautomator dump`)
 - `/packages`, `/icon`, `/signature`, `/device-info` from `PackageManager` + `dumpsys`
-- Binds 127.0.0.1 only; reachable through `adb forward`
-- Zero external dependencies, ~92 KB after R8
+- HTTP/1.1 Keep-Alive with loopback-only binding (`127.0.0.1`), reachable through `adb forward`
+- Zero external dependencies, standalone DEX JAR for `app_process`
 
 ## Build
 
@@ -50,17 +51,32 @@ curl http://127.0.0.1:9500/health
 
 ## Endpoints
 
-| Method | Path                          | Returns                              |
-|--------|-------------------------------|--------------------------------------|
-| GET    | `/health`                     | text `ok`                            |
-| GET    | `/hierarchy?compressed=true`  | `application/xml`                    |
-| GET    | `/screenshot?quality=100`     | `image/png`                          |
-| GET    | `/packages?user_only=false`   | JSON array                           |
-| GET    | `/icon?pkg=<name>`            | `image/png`                          |
-| GET    | `/signature?pkg=<name>`       | text — V1/V2/V3/V4 schemes           |
-| GET    | `/device-info`                | JSON — 14-section profile            |
-| GET    | `/info`                       | JSON — brand/model/sdk/version       |
-| GET    | `/stop`                       | text `stopping` — clean shutdown     |
+All endpoints support HTTP/1.1 Keep-Alive (up to 1000 requests per connection, 15s idle timeout).
+
+| Method   | Path                          | Returns / Notes                                                   |
+|----------|-------------------------------|-------------------------------------------------------------------|
+| GET      | `/health`                     | text `ok`                                                         |
+| GET      | `/hierarchy?compressed=true`  | `application/xml`                                                 |
+| GET      | `/screenshot`                 | `image/png`, `image/jpeg`, or `application/octet-stream` (RGBA)   |
+| GET/POST | `/input/tap`                  | JSON `{"ok":true}` (params or JSON: `x`, `y`, `durationMs`, `sync`) |
+| GET/POST | `/input/swipe`                | JSON `{"ok":true}` (params or JSON: `x1`, `y1`, `x2`, `y2`, `durationMs`, `steps`, `holdMs`, `sync`) |
+| GET/POST | `/input/key`                  | JSON `{"ok":true}` (params or JSON: `keyCode`/`keyCodes`, `metaState`, `intervalMs`, `sync`) |
+| GET/POST | `/input/global`               | JSON `{"ok":true}` (`action`: `back`, `home`, `recents`, `notifications`, `quick_settings`, `power_dialog`, `lock_screen`, `screenshot`, or numeric id) |
+| POST     | `/input/batch`                | JSON `{"ok":true}` (JSON body `{"actions":[...],"sync":true}` or `[...]`; types: `down`, `move`, `up`, `tap`, `swipe`, `wait`, `key`, `global`) |
+| GET      | `/packages?user_only=false`   | JSON array                                                        |
+| GET      | `/icon?pkg=<name>`            | `image/png`                                                       |
+| GET      | `/signature?pkg=<name>`       | text (V1/V2/V3/V4 schemes)                                        |
+| GET      | `/device-info`                | JSON (14-section profile)                                         |
+| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`version`)                            |
+| GET      | `/stop`                       | text `stopping` (clean shutdown)                                  |
+
+### `/screenshot` parameters and headers
+
+- `format`: `png` (default, quality 100), `jpeg`/`jpg` (default quality 80), or `rgba` (raw tightly packed `RGBA_8888` bytes)
+- `quality`: integer `1..100`
+- `scale`: float `0.1..1.0` (default `1.0`)
+- `fast`: `true` or `false` (default `false`); uses a persistent `VirtualDisplay` mirror when supported and falls back to `UiAutomation.takeScreenshot()` otherwise
+- Response headers: `X-Width`, `X-Height`, `X-Format`, `X-Capture-Source` (`virtual-display` or `uiautomation`)
 
 ## Notes
 
