@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "android-agent"
+version = "0.1.0"
+description = "Zero-dependency AXI CLI for inspecting and automating Android devices with AndroidAgent"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+android-agent = "android_agent_cli._entry:main"
+
+[tool.setuptools.packages.find]
+include = ["android_agent_cli*"]

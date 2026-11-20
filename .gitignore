@@ -4,3 +4,6 @@ build/
 local.properties
 .idea/
 *.iml
+__pycache__/
+*.py[cod]
+*.egg-info/
