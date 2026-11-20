@@ -292,6 +292,30 @@ def handle_status(inv: ParsedInvocation) -> dict[str, Any]:
     return payload
 
 
+def _parse_crop_arg(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != 4 or any(not p for p in parts):
+        raise UsageError(
+            f"invalid --crop format: {raw}",
+            help_hints=["Use `--crop X,Y,W,H` with 4 integers (x>=0, y>=0, w>0, h>0)"],
+        )
+    try:
+        x, y, w, h = (int(p) for p in parts)
+    except ValueError as exc:
+        raise UsageError(
+            f"invalid --crop integers: {raw}",
+            help_hints=["Use `--crop X,Y,W,H` with 4 integers (x>=0, y>=0, w>0, h>0)"],
+        ) from exc
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        raise UsageError(
+            f"invalid --crop bounds: {raw} (require x>=0, y>=0, w>0, h>0)",
+            help_hints=["Use `--crop X,Y,W,H` with non-negative x,y and positive w,h"],
+        )
+    return f"{x},{y},{w},{h}"
+
+
 def handle_screen(inv: ParsedInvocation) -> dict[str, Any]:
     fmt = inv.flags["format"]
     if fmt == "jpg":
@@ -301,6 +325,7 @@ def handle_screen(inv: ParsedInvocation) -> dict[str, Any]:
         quality = 80 if fmt == "jpeg" else 100
     scale: float = inv.flags["scale"]
     fast: bool = inv.flags["fast"]
+    crop = _parse_crop_arg(inv.flags["crop"])
     out_flag: str | None = inv.flags["out"]
 
     ext = "jpg" if fmt == "jpeg" else fmt
@@ -312,13 +337,14 @@ def handle_screen(inv: ParsedInvocation) -> dict[str, Any]:
         out_path = _temp_output_dir() / f"screen-{ts}.{ext}"
 
     with _make_client(inv.globals, timeout=20.0) as client:
-        res = client.get_screenshot(fmt=fmt, quality=quality, scale=scale, fast=fast)
+        res = client.get_screenshot(fmt=fmt, quality=quality, scale=scale, fast=fast, crop=crop)
 
     out_path.write_bytes(res.body)
     width = int(res.headers.get("x-width", "0") or 0)
     height = int(res.headers.get("x-height", "0") or 0)
     resp_fmt = res.headers.get("x-format", fmt)
     source = res.headers.get("x-capture-source", "unknown")
+    cache_hit = res.headers.get("x-cache-hit", "").strip().lower() == "true"
 
     payload: dict[str, Any] = {
         "path": str(out_path),
@@ -329,9 +355,11 @@ def handle_screen(inv: ParsedInvocation) -> dict[str, Any]:
         "source": source,
         "bytes": len(res.body),
     }
+    if cache_hit:
+        payload["cache_hit"] = True
     if scale < 1.0:
         native_hint = ""
-        if width > 0 and height > 0:
+        if crop is None and width > 0 and height > 0:
             est_w = round(width / scale)
             est_h = round(height / scale)
             native_hint = f" (approx {est_w}x{est_h} native)"

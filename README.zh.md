@@ -10,8 +10,8 @@
 
 ## 特性
 
-- `/screenshot` 支持 `UiAutomation.takeScreenshot()` 与常驻 `VirtualDisplay` 镜像 (`fast=true`), 支持 PNG/JPEG/RGBA 输出与缩放
-- `/input/*` 通过 `UiAutomation.injectInputEvent()` 实现低延迟点击、滑动、按键、全局操作与批量手势注入
+- `/screenshot` 支持 `UiAutomation.takeScreenshot()` 与常驻 `VirtualDisplay` 镜像 (`fast=true`), 支持 PNG/JPEG/RGBA 输出、缩放、区域裁剪 (`crop`) 与同帧编码缓存
+- `/input/*` 优先通过直连 `InputManager` 快速路径注入点击、滑动、按键与批量手势, 不可用时自动回退至 `UiAutomation.injectInputEvent()`
 - `/hierarchy` 走 `AccessibilityNodeInfo` 遍历 (比 `uiautomator dump` 快约 10x)
 - `/packages`、`/icon`、`/signature`、`/device-info` 由 `PackageManager` + `dumpsys` 提供
 - 支持 HTTP/1.1 Keep-Alive, 仅监听 `127.0.0.1`, 必须通过 `adb forward` 访问
@@ -74,8 +74,14 @@ curl http://127.0.0.1:9500/health
 - `format`: `png` (默认, 质量 100)、`jpeg`/`jpg` (默认质量 80) 或 `rgba` (紧密排列的 `RGBA_8888` 原始字节)
 - `quality`: 整数 `1..100`
 - `scale`: 浮点数 `0.1..1.0` (默认 `1.0`)
+- `crop`: `x,y,w,h` 整数 (基于缩放后的图像坐标, `x >= 0`, `y >= 0`, `w > 0`, `h > 0`), 自动截断至图像边界
 - `fast`: `true` 或 `false` (默认 `false`); 开启后优先走常驻 `VirtualDisplay` 镜像, 不支持或首帧未就绪时自动回退至 `UiAutomation.takeScreenshot()`
-- 响应头: `X-Width`、`X-Height`、`X-Format`、`X-Capture-Source` (`virtual-display` 或 `uiautomation`)
+- 响应头: `X-Width`、`X-Height`、`X-Format`、`X-Capture-Source` (`virtual-display` 或 `uiautomation`)、`X-Cache-Hit` (`fast=true` 命中未变更帧编码缓存时为 `true`)
+
+### `/input/*` 响应头
+
+- 响应体固定为 `{"ok":true}` 或 `{"ok":false}`
+- 响应头: `X-Input-Source` (走直连 `InputManager` / `InputManagerGlobal` 时为 `direct`, 回退或 `/input/global` 时为 `uiautomation`)
 
 ## AXI 命令行工具与 Agent Skill
 

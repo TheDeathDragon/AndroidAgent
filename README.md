@@ -10,8 +10,8 @@ install, no permissions beyond `shell` uid.
 
 ## Features
 
-- `/screenshot` via `UiAutomation.takeScreenshot()` or persistent `VirtualDisplay` mirror (`fast=true`) with PNG, JPEG, and raw RGBA output plus optional downscaling
-- `/input/*` low-latency touch, swipe, key, global action, and batched gesture injection via `UiAutomation.injectInputEvent()`
+- `/screenshot` via `UiAutomation.takeScreenshot()` or persistent `VirtualDisplay` mirror (`fast=true`) with PNG, JPEG, and raw RGBA output, downscaling, region cropping (`crop`), and per-frame encoding cache
+- `/input/*` low-latency touch, swipe, key, global action, and batched gesture injection via direct `InputManager` fast path with `UiAutomation.injectInputEvent()` fallback
 - `/hierarchy` via `AccessibilityNodeInfo` walk (~10x faster than `uiautomator dump`)
 - `/packages`, `/icon`, `/signature`, `/device-info` from `PackageManager` + `dumpsys`
 - HTTP/1.1 Keep-Alive with loopback-only binding (`127.0.0.1`), reachable through `adb forward`
@@ -75,8 +75,14 @@ All endpoints support HTTP/1.1 Keep-Alive (up to 1000 requests per connection, 1
 - `format`: `png` (default, quality 100), `jpeg`/`jpg` (default quality 80), or `rgba` (raw tightly packed `RGBA_8888` bytes)
 - `quality`: integer `1..100`
 - `scale`: float `0.1..1.0` (default `1.0`)
+- `crop`: `x,y,w,h` integers in scaled image coordinates (`x >= 0`, `y >= 0`, `w > 0`, `h > 0`), clamped to image bounds
 - `fast`: `true` or `false` (default `false`); uses a persistent `VirtualDisplay` mirror when supported and falls back to `UiAutomation.takeScreenshot()` otherwise
-- Response headers: `X-Width`, `X-Height`, `X-Format`, `X-Capture-Source` (`virtual-display` or `uiautomation`)
+- Response headers: `X-Width`, `X-Height`, `X-Format`, `X-Capture-Source` (`virtual-display` or `uiautomation`), `X-Cache-Hit` (`true` when `fast=true` serves an unchanged encoded frame)
+
+### `/input/*` headers
+
+- Response body is always `{"ok":true}` or `{"ok":false}`
+- Response header: `X-Input-Source` (`direct` when injected via `InputManager` / `InputManagerGlobal`, or `uiautomation` on fallback or `/input/global`)
 
 ## AXI CLI & Agent Skill
 

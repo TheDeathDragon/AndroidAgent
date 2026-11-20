@@ -82,17 +82,19 @@ android-agent -p 9501 health
 
 Capture device screenshot to a file and print TOON metadata.
 
-Usage: `android-agent screen [--out PATH] [--format jpeg|png|rgba] [--quality 1..100] [--scale 0.1..1.0] [--fast|--no-fast]`
+Usage: `android-agent screen [--out PATH] [--format jpeg|png|rgba] [--quality 1..100] [--scale 0.1..1.0] [--crop X,Y,W,H] [--fast|--no-fast]`
 
 - `--out PATH`: Output file path (default: temp dir)
 - `--format FMT`: Image format: jpeg, png, or rgba (default: jpeg)
 - `--quality INT`: Compression quality 1..100 (default: 80 for jpeg, 100 for png/rgba)
 - `--scale FLOAT`: Downscale factor 0.1..1.0 (default: 0.5)
+- `--crop X,Y,W,H`: Crop region in scaled image pixels: x,y,w,h (x>=0, y>=0, w>0, h>0)
 - `--fast/--no-fast`: Use VirtualDisplay mirror when available (default: --fast)
 
 ```sh
 android-agent screen
 android-agent screen --format png --scale 1.0 --out screen.png
+android-agent screen --crop 0,0,540,400 --scale 0.5
 android-agent screen --no-fast --quality 90
 ```
 

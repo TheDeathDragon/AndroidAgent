@@ -249,6 +249,14 @@ class SimpleHttpServer(
 
         val result = try {
             screenCapture.capture(captureRequest)
+        } catch (e: BadRequestException) {
+            HttpProtocol.writeResponse(
+                output,
+                HttpResponse.text(HttpStatus.BAD_REQUEST, e.message ?: "bad request"),
+                keepAlive = keepAlive,
+                headOnly = headOnly
+            )
+            return
         } catch (e: Throwable) {
             System.err.println("[Agent] Screenshot failed: ${e.message}")
             HttpProtocol.writeResponse(
@@ -336,26 +344,22 @@ class SimpleHttpServer(
 
     private fun handleInputTap(request: HttpRequest): HttpResponse {
         val command = InputController.parseTap(request)
-        val ok = inputController.execute(command)
-        return inputResultResponse(ok)
+        return inputResultResponse(inputController.execute(command))
     }
 
     private fun handleInputSwipe(request: HttpRequest): HttpResponse {
         val command = InputController.parseSwipe(request)
-        val ok = inputController.execute(command)
-        return inputResultResponse(ok)
+        return inputResultResponse(inputController.execute(command))
     }
 
     private fun handleInputKey(request: HttpRequest): HttpResponse {
         val command = InputController.parseKey(request)
-        val ok = inputController.execute(command)
-        return inputResultResponse(ok)
+        return inputResultResponse(inputController.execute(command))
     }
 
     private fun handleInputGlobal(request: HttpRequest): HttpResponse {
         val command = InputController.parseGlobal(request)
-        val ok = inputController.execute(command)
-        return inputResultResponse(ok)
+        return inputResultResponse(inputController.execute(command))
     }
 
     private fun handleInputBatch(request: HttpRequest): HttpResponse {
@@ -363,15 +367,15 @@ class SimpleHttpServer(
             throw MethodNotAllowedException("batch requires POST", "POST")
         }
         val batch = InputController.parseBatch(request)
-        val ok = inputController.executeBatch(batch)
-        return inputResultResponse(ok)
+        return inputResultResponse(inputController.executeBatch(batch))
     }
 
-    private fun inputResultResponse(ok: Boolean): HttpResponse {
+    private fun inputResultResponse(result: InputResult): HttpResponse {
         return HttpResponse.text(
             HttpStatus.OK,
-            if (ok) """{"ok":true}""" else """{"ok":false}""",
-            "application/json; charset=utf-8"
+            if (result.ok) """{"ok":true}""" else """{"ok":false}""",
+            "application/json; charset=utf-8",
+            headers = mapOf("X-Input-Source" to result.source)
         )
     }
 

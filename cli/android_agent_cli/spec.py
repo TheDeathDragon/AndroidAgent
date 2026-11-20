@@ -245,12 +245,13 @@ COMMANDS: tuple[CommandSpec, ...] = (
         name="screen",
         aliases=("screenshot", "shot"),
         summary="Capture device screenshot to a file and print TOON metadata",
-        usage="android-agent screen [--out PATH] [--format jpeg|png|rgba] [--quality 1..100] [--scale 0.1..1.0] [--fast|--no-fast]",
+        usage="android-agent screen [--out PATH] [--format jpeg|png|rgba] [--quality 1..100] [--scale 0.1..1.0] [--crop X,Y,W,H] [--fast|--no-fast]",
         flags=(
             FlagSpec("out", "--out", kind="str", default=None, value_name="PATH", description="Output file path (default: temp dir)"),
             FlagSpec("format", "--format", kind="str", default="jpeg", value_name="FMT", description="Image format: jpeg, png, or rgba (default: jpeg)", choices=("jpeg", "jpg", "png", "rgba")),
             FlagSpec("quality", "--quality", kind="int", default=None, value_name="INT", description="Compression quality 1..100 (default: 80 for jpeg, 100 for png/rgba)", min_val=1, max_val=100),
             FlagSpec("scale", "--scale", kind="float", default=0.5, value_name="FLOAT", description="Downscale factor 0.1..1.0 (default: 0.5)", min_val=0.1, max_val=1.0),
+            FlagSpec("crop", "--crop", kind="str", default=None, value_name="X,Y,W,H", description="Crop region in scaled image pixels: x,y,w,h (x>=0, y>=0, w>0, h>0)"),
             FlagSpec("fast", "--fast", negated="--no-fast", kind="bool", default=True, description="Use VirtualDisplay mirror when available (default: --fast)"),
         ),
         renamed_flags={
@@ -259,6 +260,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         examples=(
             "android-agent screen",
             "android-agent screen --format png --scale 1.0 --out screen.png",
+            "android-agent screen --crop 0,0,540,400 --scale 0.5",
             "android-agent screen --no-fast --quality 90",
         ),
         min_args=0,

@@ -1,9 +1,11 @@
 package la.shiro.agent
 
 import android.accessibilityservice.AccessibilityService
+import android.annotation.SuppressLint
 import android.annotation.TargetApi
 import android.app.UiAutomation
 import android.os.Build
+import android.os.IBinder
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.InputEvent
@@ -13,6 +15,8 @@ import android.view.MotionEvent
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Method
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
@@ -78,6 +82,11 @@ data class InputBatch(
     val sync: Boolean = true
 )
 
+data class InputResult(
+    val ok: Boolean,
+    val source: String
+)
+
 // Isolated helper so R8 does not inline the API 34+ 3-arg overload into InputController on API 30-33.
 @TargetApi(34)
 internal object Api34InputInjector {
@@ -88,15 +97,121 @@ internal object Api34InputInjector {
 
 class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
 
+    private class DirectInputInjector {
+        @Volatile
+        private var directAvailable = true
+        private var initialized = false
+        private var target: Any? = null
+        private var injectMethod: Method? = null
+
+        fun inject(event: InputEvent, sync: Boolean): Boolean? {
+            if (!directAvailable) return null
+            if (!ensureInitialized()) return null
+            val receiver = target ?: return null
+            val method = injectMethod ?: return null
+            val mode = if (sync) {
+                INJECT_INPUT_EVENT_MODE_WAIT_FOR_FINISH
+            } else {
+                INJECT_INPUT_EVENT_MODE_ASYNC
+            }
+            return try {
+                (method.invoke(receiver, event, mode) as? Boolean) ?: false
+            } catch (t: Throwable) {
+                disablePermanently(t)
+                null
+            }
+        }
+
+        private fun ensureInitialized(): Boolean {
+            if (initialized) return directAvailable
+            synchronized(this) {
+                if (initialized) return directAvailable
+                initialized = true
+                val resolved = resolveTargetAndMethod()
+                if (resolved == null) {
+                    disablePermanently(IllegalStateException("no direct InputManager injection target found"))
+                    return false
+                }
+                target = resolved.first
+                injectMethod = resolved.second
+                return true
+            }
+        }
+
+        @SuppressLint("PrivateApi", "DiscouragedPrivateApi")
+        private fun resolveTargetAndMethod(): Pair<Any, Method>? {
+            resolveStaticSingleton("android.hardware.input.InputManagerGlobal")?.let { return it }
+            resolveStaticSingleton("android.hardware.input.InputManager")?.let { return it }
+            return resolveBinderService()
+        }
+
+        @SuppressLint("PrivateApi", "DiscouragedPrivateApi")
+        private fun resolveStaticSingleton(className: String): Pair<Any, Method>? {
+            return try {
+                val clazz = Class.forName(className)
+                val instance = clazz.getMethod("getInstance").invoke(null) ?: return null
+                val method = clazz.getMethod(
+                    "injectInputEvent",
+                    InputEvent::class.java,
+                    Int::class.javaPrimitiveType
+                )
+                instance to method
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        @SuppressLint("PrivateApi", "DiscouragedPrivateApi")
+        private fun resolveBinderService(): Pair<Any, Method>? {
+            return try {
+                val smClass = Class.forName("android.os.ServiceManager")
+                val binder = smClass.getMethod("getService", String::class.java)
+                    .invoke(null, "input") as? IBinder ?: return null
+                val stubClass = Class.forName("android.hardware.input.IInputManager\$Stub")
+                val service = stubClass.getMethod("asInterface", IBinder::class.java)
+                    .invoke(null, binder) ?: return null
+                val ifaceClass = Class.forName("android.hardware.input.IInputManager")
+                val method = ifaceClass.getMethod(
+                    "injectInputEvent",
+                    InputEvent::class.java,
+                    Int::class.javaPrimitiveType
+                )
+                service to method
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        private fun disablePermanently(error: Throwable) {
+            if (!directAvailable) return
+            directAvailable = false
+            target = null
+            injectMethod = null
+            val cause = if (error is InvocationTargetException) error.cause ?: error else error
+            System.err.println(
+                "[Agent] Direct InputManager injection unavailable, falling back to UiAutomation: " +
+                    "${cause.javaClass.simpleName}: ${cause.message}"
+            )
+        }
+
+        companion object {
+            private const val INJECT_INPUT_EVENT_MODE_ASYNC: Int = 0
+            private const val INJECT_INPUT_EVENT_MODE_WAIT_FOR_FINISH: Int = 2
+        }
+    }
+
     private val inputLock = Any()
     private val cancelled = AtomicBoolean(false)
     private val useApi34Injector = AtomicBoolean(Build.VERSION.SDK_INT >= 34)
+    private val directInjector = DirectInputInjector()
+    private var batchUsedDirect = false
+    private var batchUsedUiAutomation = false
 
-    fun execute(command: InputCommand): Boolean {
+    fun execute(command: InputCommand): InputResult {
         return executeBatch(InputBatch(listOf(command.action), command.sync))
     }
 
-    fun executeBatch(batch: InputBatch): Boolean {
+    fun executeBatch(batch: InputBatch): InputResult {
         synchronized(inputLock) {
             checkNotCancelled()
             var touchDown = false
@@ -104,6 +219,8 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
             var touchX = 0f
             var touchY = 0f
             var allOk = true
+            batchUsedDirect = false
+            batchUsedUiAutomation = false
 
             try {
                 val actions = batch.actions
@@ -224,13 +341,19 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
                             }
                         }
                         is InputAction.Global -> {
+                            batchUsedUiAutomation = true
                             if (!uiAutomation.performGlobalAction(action.actionId)) {
                                 allOk = false
                             }
                         }
                     }
                 }
-                return allOk
+                val source = if (batchUsedDirect && !batchUsedUiAutomation) {
+                    SOURCE_DIRECT
+                } else {
+                    SOURCE_UIAUTOMATION
+                }
+                return InputResult(allOk, source)
             } finally {
                 if (touchDown) {
                     try {
@@ -390,6 +513,12 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
     }
 
     private fun inject(event: InputEvent, sync: Boolean): Boolean {
+        val directResult = directInjector.inject(event, sync)
+        if (directResult != null) {
+            batchUsedDirect = true
+            return directResult
+        }
+        batchUsedUiAutomation = true
         if (useApi34Injector.get()) {
             try {
                 return Api34InputInjector.inject(uiAutomation, event, sync)
@@ -421,6 +550,8 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
     }
 
     companion object {
+        private const val SOURCE_DIRECT: String = "direct"
+        private const val SOURCE_UIAUTOMATION: String = "uiautomation"
         private const val MAX_DURATION_MS: Long = 30_000L
         private const val MAX_HOLD_MS: Long = 10_000L
         private const val MIN_STEPS: Int = 1

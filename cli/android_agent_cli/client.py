@@ -175,16 +175,20 @@ class AgentClient:
         quality: int = 80,
         scale: float = 0.5,
         fast: bool = True,
+        crop: str | None = None,
     ) -> HttpResult:
+        params: dict[str, Any] = {
+            "format": fmt,
+            "quality": str(quality),
+            "scale": f"{scale:g}",
+            "fast": "true" if fast else "false",
+        }
+        if crop is not None:
+            params["crop"] = crop
         return self.request(
             "GET",
             "/screenshot",
-            params={
-                "format": fmt,
-                "quality": str(quality),
-                "scale": f"{scale:g}",
-                "fast": "true" if fast else "false",
-            },
+            params=params,
         )
 
     def post_tap(self, x: float, y: float, duration_ms: int = 0, sync: bool = True) -> dict[str, Any]:

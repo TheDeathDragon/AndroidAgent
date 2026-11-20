@@ -55,11 +55,49 @@ enum class CaptureSource(val wireName: String) {
     UI_AUTOMATION("uiautomation")
 }
 
+data class CropRect(
+    val x: Int,
+    val y: Int,
+    val width: Int,
+    val height: Int
+) {
+    fun clampTo(imageWidth: Int, imageHeight: Int): CropRect {
+        if (x >= imageWidth || y >= imageHeight) {
+            throw BadRequestException("crop origin outside image bounds")
+        }
+        val outW = minOf(width, imageWidth - x)
+        val outH = minOf(height, imageHeight - y)
+        return CropRect(x, y, outW, outH)
+    }
+
+    companion object {
+        fun parse(raw: String): CropRect {
+            val parts = raw.split(',')
+            if (parts.size != 4) {
+                throw BadRequestException("invalid crop format, expected x,y,w,h: $raw")
+            }
+            val x = parts[0].trim().toIntOrNull()
+                ?: throw BadRequestException("invalid crop x: $raw")
+            val y = parts[1].trim().toIntOrNull()
+                ?: throw BadRequestException("invalid crop y: $raw")
+            val w = parts[2].trim().toIntOrNull()
+                ?: throw BadRequestException("invalid crop width: $raw")
+            val h = parts[3].trim().toIntOrNull()
+                ?: throw BadRequestException("invalid crop height: $raw")
+            if (x < 0 || y < 0 || w <= 0 || h <= 0) {
+                throw BadRequestException("invalid crop bounds (require x>=0, y>=0, w>0, h>0): $raw")
+            }
+            return CropRect(x, y, w, h)
+        }
+    }
+}
+
 data class CaptureRequest(
     val format: ImageFormat = ImageFormat.PNG,
     val quality: Int = format.defaultQuality,
     val scale: Float = 1.0f,
-    val fast: Boolean = false
+    val fast: Boolean = false,
+    val crop: CropRect? = null
 ) {
     companion object {
         fun parse(params: Map<String, String>): CaptureRequest {
@@ -87,7 +125,11 @@ data class CaptureRequest(
                     ?: throw BadRequestException("invalid fast flag: $raw")
             } ?: false
 
-            return CaptureRequest(format, quality, scale, fast)
+            val crop = params["crop"]?.let { raw ->
+                CropRect.parse(raw)
+            }
+
+            return CaptureRequest(format, quality, scale, fast, crop)
         }
     }
 }
@@ -99,6 +141,7 @@ class CaptureResult(
     val height: Int,
     val format: ImageFormat,
     val source: CaptureSource,
+    val cacheHit: Boolean = false,
     private val onClose: () -> Unit
 ) : AutoCloseable {
 
@@ -108,7 +151,8 @@ class CaptureResult(
         "X-Width" to width.toString(),
         "X-Height" to height.toString(),
         "X-Format" to format.wireName,
-        "X-Capture-Source" to source.wireName
+        "X-Capture-Source" to source.wireName,
+        "X-Cache-Hit" to cacheHit.toString()
     )
 
     override fun close() {
@@ -275,6 +319,16 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
         val targetHeight: Int
     )
 
+    private class EncodedCache(
+        val frameVersion: Long,
+        val format: ImageFormat,
+        val quality: Int,
+        val crop: CropRect?,
+        val width: Int,
+        val height: Int,
+        val data: ByteArray
+    )
+
     private sealed class VirtualDisplayState {
         object Uninitialized : VirtualDisplayState()
         class Active(
@@ -286,7 +340,11 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
             var latestRgba: ByteArray,
             var backRgba: ByteArray,
             var hasFrame: Boolean,
+            var firstFrameTimedOut: Boolean = false,
+            var frameVersion: Long = 0L,
             var encodeBitmap: Bitmap?,
+            var cropBitmap: Bitmap? = null,
+            var encodedCache: EncodedCache? = null,
             var disposed: Boolean = false
         ) : VirtualDisplayState()
         class Unavailable(val reason: String) : VirtualDisplayState()
@@ -353,43 +411,122 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                 if (!awaitFirstFrame(active)) {
                     return null
                 }
-                val width = active.config.targetWidth
-                val height = active.config.targetHeight
-                val byteCount = width * height * 4
+                val targetW = active.config.targetWidth
+                val targetH = active.config.targetHeight
+                val clampedCrop = request.crop?.clampTo(targetW, targetH)
+                val effectiveCrop = if (
+                    clampedCrop != null &&
+                    (clampedCrop.x != 0 || clampedCrop.y != 0 || clampedCrop.width != targetW || clampedCrop.height != targetH)
+                ) {
+                    clampedCrop
+                } else {
+                    null
+                }
+                val outW = effectiveCrop?.width ?: targetW
+                val outH = effectiveCrop?.height ?: targetH
+                val outByteCount = outW * outH * 4
+
+                val currentVersion = active.frameLock.withLock {
+                    if (active.disposed || !active.hasFrame) -1L else active.frameVersion
+                }
+                if (currentVersion < 0L) return null
+
+                if (request.format != ImageFormat.RGBA) {
+                    val cached = active.encodedCache
+                    if (
+                        cached != null &&
+                        cached.frameVersion == currentVersion &&
+                        cached.format == request.format &&
+                        cached.quality == request.quality &&
+                        cached.crop == effectiveCrop
+                    ) {
+                        val dst = stream.prepareExact(cached.data.size)
+                        System.arraycopy(cached.data, 0, dst, 0, cached.data.size)
+                        handedOff = true
+                        return CaptureResult(
+                            buffer = stream.rawBuffer,
+                            length = cached.data.size,
+                            width = cached.width,
+                            height = cached.height,
+                            format = request.format,
+                            source = CaptureSource.VIRTUAL_DISPLAY,
+                            cacheHit = true,
+                            onClose = { bufferPool.release(stream) }
+                        )
+                    }
+                }
 
                 when (request.format) {
                     ImageFormat.RGBA -> {
-                        val dst = stream.prepareExact(byteCount)
+                        val dst = stream.prepareExact(outByteCount)
                         val copied = active.frameLock.withLock {
                             if (active.disposed || !active.hasFrame) {
                                 false
                             } else {
-                                System.arraycopy(active.latestRgba, 0, dst, 0, byteCount)
+                                copyRgbaRegion(active.latestRgba, targetW, effectiveCrop, dst, outByteCount)
                                 true
                             }
                         }
                         if (!copied) return null
                     }
                     ImageFormat.PNG, ImageFormat.JPEG -> {
-                        val bitmap = active.encodeBitmap
-                            ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
-                                active.encodeBitmap = it
+                        val bitmap: Bitmap
+                        val encodedVersion: Long
+                        if (effectiveCrop == null) {
+                            bitmap = active.encodeBitmap
+                                ?: Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888).also {
+                                    active.encodeBitmap = it
+                                }
+                            encodedVersion = active.frameLock.withLock {
+                                if (active.disposed || !active.hasFrame) {
+                                    -1L
+                                } else {
+                                    bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(active.latestRgba, 0, outByteCount))
+                                    active.frameVersion
+                                }
                             }
-                        val copied = active.frameLock.withLock {
-                            if (active.disposed || !active.hasFrame) {
-                                false
+                            if (encodedVersion < 0L) return null
+                        } else {
+                            val existingCrop = active.cropBitmap
+                            bitmap = if (existingCrop != null && existingCrop.width == outW && existingCrop.height == outH) {
+                                existingCrop
                             } else {
-                                bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(active.latestRgba, 0, byteCount))
-                                true
+                                try { existingCrop?.recycle() } catch (_: Throwable) {}
+                                Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888).also {
+                                    active.cropBitmap = it
+                                }
                             }
+                            val scratch = stream.prepareExact(outByteCount)
+                            encodedVersion = active.frameLock.withLock {
+                                if (active.disposed || !active.hasFrame) {
+                                    -1L
+                                } else {
+                                    copyRgbaRegion(active.latestRgba, targetW, effectiveCrop, scratch, outByteCount)
+                                    active.frameVersion
+                                }
+                            }
+                            if (encodedVersion < 0L) return null
+                            bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(scratch, 0, outByteCount))
+                            stream.reset()
                         }
-                        if (!copied) return null
+
                         val compressFormat = if (request.format == ImageFormat.PNG) {
                             Bitmap.CompressFormat.PNG
                         } else {
                             Bitmap.CompressFormat.JPEG
                         }
                         bitmap.compress(compressFormat, request.quality, stream)
+                        if (stream.length <= MAX_ENCODED_CACHE_BYTES) {
+                            active.encodedCache = EncodedCache(
+                                frameVersion = encodedVersion,
+                                format = request.format,
+                                quality = request.quality,
+                                crop = effectiveCrop,
+                                width = outW,
+                                height = outH,
+                                data = stream.rawBuffer.copyOf(stream.length)
+                            )
+                        }
                     }
                 }
 
@@ -397,10 +534,11 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                 return CaptureResult(
                     buffer = stream.rawBuffer,
                     length = stream.length,
-                    width = width,
-                    height = height,
+                    width = outW,
+                    height = outH,
                     format = request.format,
                     source = CaptureSource.VIRTUAL_DISPLAY,
+                    cacheHit = false,
                     onClose = { bufferPool.release(stream) }
                 )
             }
@@ -526,6 +664,8 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                 active.latestRgba = active.backRgba
                 active.backRgba = swapped
                 active.hasFrame = true
+                active.firstFrameTimedOut = false
+                active.frameVersion++
                 active.frameReady.signalAll()
             }
         } catch (_: IllegalStateException) {
@@ -542,6 +682,8 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
     private fun awaitFirstFrame(active: VirtualDisplayState.Active): Boolean {
         var remainingNs = FIRST_FRAME_TIMEOUT_MS * 1_000_000L
         return active.frameLock.withLock {
+            if (active.hasFrame && !active.disposed) return@withLock true
+            if (active.firstFrameTimedOut || active.disposed) return@withLock false
             while (!active.hasFrame && !active.disposed && remainingNs > 0L) {
                 try {
                     remainingNs = active.frameReady.awaitNanos(remainingNs)
@@ -550,18 +692,46 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                     return@withLock false
                 }
             }
+            if (!active.hasFrame && !active.disposed) {
+                active.firstFrameTimedOut = true
+            }
             active.hasFrame && !active.disposed
+        }
+    }
+
+    private fun copyRgbaRegion(
+        src: ByteArray,
+        srcWidth: Int,
+        crop: CropRect?,
+        dst: ByteArray,
+        outByteCount: Int
+    ) {
+        if (crop == null) {
+            System.arraycopy(src, 0, dst, 0, outByteCount)
+            return
+        }
+        val srcStride = srcWidth * 4
+        val dstStride = crop.width * 4
+        if (crop.x == 0 && crop.width == srcWidth) {
+            System.arraycopy(src, crop.y * srcStride, dst, 0, outByteCount)
+            return
+        }
+        val srcXOffset = crop.x * 4
+        for (row in 0 until crop.height) {
+            val srcOffset = (crop.y + row) * srcStride + srcXOffset
+            System.arraycopy(src, srcOffset, dst, row * dstStride, dstStride)
         }
     }
 
     private fun captureViaUiAutomation(request: CaptureRequest): CaptureResult? {
         val rawBitmap: Bitmap = uiAutomation.takeScreenshot() ?: return null
         var scaledBitmap: Bitmap? = null
+        var croppedBitmap: Bitmap? = null
         var rgbaBitmap: Bitmap? = null
         val stream = bufferPool.acquire()
         var handedOff = false
         try {
-            val working: Bitmap = if (request.scale < 1.0f) {
+            val scaled: Bitmap = if (request.scale < 1.0f) {
                 val targetW = (rawBitmap.width * request.scale).roundToInt().coerceAtLeast(1)
                 val targetH = (rawBitmap.height * request.scale).roundToInt().coerceAtLeast(1)
                 if (targetW != rawBitmap.width || targetH != rawBitmap.height) {
@@ -573,6 +743,19 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                 }
             } else {
                 rawBitmap
+            }
+
+            val working: Bitmap = if (request.crop != null) {
+                val clamped = request.crop.clampTo(scaled.width, scaled.height)
+                if (clamped.x != 0 || clamped.y != 0 || clamped.width != scaled.width || clamped.height != scaled.height) {
+                    Bitmap.createBitmap(scaled, clamped.x, clamped.y, clamped.width, clamped.height).also {
+                        croppedBitmap = it
+                    }
+                } else {
+                    scaled
+                }
+            } else {
+                scaled
             }
 
             when (request.format) {
@@ -602,14 +785,18 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                 height = working.height,
                 format = request.format,
                 source = CaptureSource.UI_AUTOMATION,
+                cacheHit = false,
                 onClose = { bufferPool.release(stream) }
             )
         } finally {
             if (!handedOff) {
                 bufferPool.release(stream)
             }
-            if (rgbaBitmap != null && rgbaBitmap !== scaledBitmap && rgbaBitmap !== rawBitmap) {
+            if (rgbaBitmap != null && rgbaBitmap !== croppedBitmap && rgbaBitmap !== scaledBitmap && rgbaBitmap !== rawBitmap) {
                 rgbaBitmap?.recycle()
+            }
+            if (croppedBitmap != null && croppedBitmap !== scaledBitmap && croppedBitmap !== rawBitmap) {
+                croppedBitmap?.recycle()
             }
             if (scaledBitmap != null && scaledBitmap !== rawBitmap) {
                 scaledBitmap?.recycle()
@@ -658,6 +845,9 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
         try { active.imageReader.close() } catch (_: Throwable) {}
         try { active.encodeBitmap?.recycle() } catch (_: Throwable) {}
         active.encodeBitmap = null
+        try { active.cropBitmap?.recycle() } catch (_: Throwable) {}
+        active.cropBitmap = null
+        active.encodedCache = null
     }
 
     override fun close() {
@@ -679,5 +869,6 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
         private const val DEFAULT_DISPLAY_ID: Int = 0
         private const val IMAGE_READER_MAX_IMAGES: Int = 3
         private const val FIRST_FRAME_TIMEOUT_MS: Long = 300L
+        private const val MAX_ENCODED_CACHE_BYTES: Int = 4 * 1024 * 1024
     }
 }

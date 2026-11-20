@@ -115,6 +115,7 @@ class _MockAgentServer(http.server.ThreadingHTTPServer):
         self.connection_count = 0
         self.hierarchy_xml = MOCK_HIERARCHY_XML
         self.stopped = False
+        self.screenshot_cache_hit = False
 
 
 class _MockAgentHandler(http.server.BaseHTTPRequestHandler):
@@ -166,6 +167,10 @@ class _MockAgentHandler(http.server.BaseHTTPRequestHandler):
             scale = float(query.get("scale", "1.0"))
             w = round(1080 * scale)
             h = round(2400 * scale)
+            if "crop" in query:
+                cx, cy, cw, ch = (int(v) for v in query["crop"].split(","))
+                w = min(cw, w - cx)
+                h = min(ch, h - cy)
             payload = b"\xff\xd8\xff\xe0MOCKJPEG" if fmt == "jpeg" else b"\x89PNG\r\n\x1a\nMOCKPNG"
             self._send(
                 200,
@@ -176,6 +181,7 @@ class _MockAgentHandler(http.server.BaseHTTPRequestHandler):
                     "X-Height": str(h),
                     "X-Format": fmt,
                     "X-Capture-Source": "virtual-display" if query.get("fast") == "true" else "uiautomation",
+                    "X-Cache-Hit": "true" if self.server.screenshot_cache_hit else "false",
                 },
             )
         elif parsed.path == "/packages":
@@ -249,7 +255,31 @@ class TestCommandsMock(unittest.TestCase):
             self.assertIn("width: 540", out)
             self.assertIn("height: 1200", out)
             self.assertIn("source: virtual-display", out)
+            self.assertNotIn("cache_hit:", out)
             self.assertIn("coords_note:", out)
+
+    def test_screen_crop_validation_forwarding_and_cache_hit(self) -> None:
+        req_before = len(self.srv.requests)
+        for bad_crop in ("10,20,30", "10,20,30,40,50", "a,0,100,100", "-1,0,100,100", "0,-2,100,100", "0,0,0,100", "0,0,100,-5"):
+            code_bad, out_bad, err_bad = self._run(["screen", "--crop", bad_crop])
+            self.assertEqual(code_bad, 2, msg=f"expected exit 2 for crop={bad_crop}")
+            self.assertEqual(err_bad, "")
+            self.assertIn("error:", out_bad)
+        self.assertEqual(len(self.srv.requests), req_before)
+
+        self.srv.screenshot_cache_hit = True
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = Path(tmp) / "crop.jpg"
+            code, out, err = self._run(["screen", "--crop", "10,20,200,300", "--out", str(out_file)])
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            self.assertTrue(out_file.is_file())
+            self.assertIn("width: 200", out)
+            self.assertIn("height: 300", out)
+            self.assertIn("cache_hit: true", out)
+            method, path, query = self.srv.requests[-1]
+            self.assertEqual((method, path), ("GET", "/screenshot"))
+            self.assertEqual(query.get("crop"), "10,20,200,300")
 
     def test_ui_table_xml_truncation_and_empty_state(self) -> None:
         code, out, _ = self._run(["ui"])
