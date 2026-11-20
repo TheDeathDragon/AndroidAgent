@@ -208,7 +208,11 @@ class _MockAgentHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         payload = json.loads(body.decode("utf-8")) if body else None
         self.server.requests.append(("POST", parsed.path, payload))
-        extra = {"X-Input-Source": "direct"} if parsed.path in ("/input/tap", "/input/swipe", "/input/key", "/input/batch") else None
+        extra = (
+            {"X-Input-Source": "direct"}
+            if parsed.path in ("/input/tap", "/input/swipe", "/input/key", "/input/text", "/input/batch")
+            else None
+        )
         self._send(200, b'{"ok":true}', "application/json", extra)
 
 
@@ -378,12 +382,57 @@ class TestCommandsMock(unittest.TestCase):
                 {"type": "down", "x": 100, "y": 200},
                 {"type": "move", "x": 150, "y": 250},
                 {"type": "up"},
+                {"type": "text", "text": "hello", "clear": True},
             ]
         )
         code_ok, out_ok, _ = self._run(["batch", valid_batch])
         self.assertEqual(code_ok, 0)
-        self.assertIn("actions: 3", out_ok)
+        self.assertIn("actions: 4", out_ok)
         self.assertIn("source: direct", out_ok)
+
+    def test_type_wait_and_launch_commands(self) -> None:
+        # 1. type with selector taps element, types text, and submits over one Keep-Alive socket.
+        conns_before = self.srv.connection_count
+        code_t, out_t, err_t = self._run(["type", "wifi_pass", "--text", "Wi-Fi", "--clear", "--submit"])
+        self.assertEqual(code_t, 0, msg=out_t)
+        self.assertEqual(err_t, "")
+        self.assertEqual(self.srv.connection_count - conns_before, 1)
+        self.assertIn("text: wifi_pass", out_t)
+        self.assertIn("clear: true", out_t)
+        self.assertIn("submit: true", out_t)
+        self.assertIn("target: Wi-Fi", out_t)
+        self.assertIn("source: direct", out_t)
+
+        # type without text and without --clear fails with exit 2.
+        code_bad_t, out_bad_t, _ = self._run(["type"])
+        self.assertEqual(code_bad_t, 2)
+        self.assertIn("requires a <text> argument", out_bad_t)
+
+        # 2. wait matches immediately when present, supports --gone, and exits 1 on timeout.
+        code_w, out_w, _ = self._run(["wait", "--text", "Wi-Fi", "--timeout", "1"])
+        self.assertEqual(code_w, 0)
+        self.assertIn("status: matched", out_w)
+        self.assertIn("Wi-Fi", out_w)
+
+        code_g, out_g, _ = self._run(["wait", "--text", "NonExistent", "--gone", "--timeout", "1"])
+        self.assertEqual(code_g, 0)
+        self.assertIn("status: gone", out_g)
+
+        code_to, out_to, _ = self._run(["wait", "--text", "NonExistent", "--timeout", "0.15", "--interval", "50"])
+        self.assertEqual(code_to, 1)
+        self.assertIn("timed out after 0.15s", out_to)
+
+        # 3. launch resolves mainActivity from /packages and invokes adb am start.
+        with mock.patch("android_agent_cli.handlers.adb.resolve_serial", return_value="SER1"), mock.patch(
+            "android_agent_cli.handlers.adb.run_adb"
+        ) as mock_adb:
+            mock_adb.return_value = mock.Mock(returncode=0, stdout="Starting: Intent", stderr="")
+            code_l, out_l, _ = self._run(["launch", "com.example.userapp", "--stop", "--wait"])
+            self.assertEqual(code_l, 0, msg=out_l)
+            self.assertIn("status: launched", out_l)
+            self.assertIn("component: com.example.userapp/.MainActivity", out_l)
+            self.assertIn("stopped_first: true", out_l)
+            self.assertEqual(mock_adb.call_count, 2)
 
     def test_packages_package_signature_icon_and_device(self) -> None:
         code_p, out_p, _ = self._run(["packages"])

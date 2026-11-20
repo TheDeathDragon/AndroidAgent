@@ -97,8 +97,12 @@ class UiSnapshot:
     rotation: int
     nodes: list[UiNode]
     children_map: dict[int, list[int]]
+    width: int = 0
+    height: int = 0
 
     def screen_size(self) -> tuple[int, int] | None:
+        if self.width > 0 and self.height > 0:
+            return (self.width, self.height)
         max_x = 0
         max_y = 0
         for node in self.nodes:
@@ -189,6 +193,12 @@ def parse_hierarchy_xml(xml_text: str) -> UiSnapshot:
     except ValueError:
         rotation = 0
 
+    try:
+        width = max(0, int(root.attrib.get("width", "0") or 0))
+        height = max(0, int(root.attrib.get("height", "0") or 0))
+    except ValueError:
+        width, height = 0, 0
+
     nodes: list[UiNode] = []
     children_map: dict[int, list[int]] = {}
 
@@ -233,7 +243,7 @@ def parse_hierarchy_xml(xml_text: str) -> UiSnapshot:
 
     walk(root, None)
     _hoist_labels(nodes, children_map)
-    return UiSnapshot(rotation=rotation, nodes=nodes, children_map=children_map)
+    return UiSnapshot(rotation=rotation, nodes=nodes, children_map=children_map, width=width, height=height)
 
 
 def _match_str(haystack: str, needle: str, exact: bool) -> bool:

@@ -257,6 +257,25 @@ class AgentClient:
             )
         )
 
+    def post_text(
+        self,
+        text: str,
+        clear: bool = False,
+        sync: bool = True,
+    ) -> dict[str, Any]:
+        return self._parse_input_response(
+            self.request(
+                "POST",
+                "/input/text",
+                json_body={
+                    "text": text,
+                    "clear": clear,
+                    "sync": sync,
+                },
+                retry_on_reset=False,
+            )
+        )
+
     def post_global(self, action: str | int) -> dict[str, Any]:
         return self.request(
             "POST",

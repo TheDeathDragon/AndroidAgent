@@ -60,8 +60,9 @@ curl http://127.0.0.1:9500/health
 | GET/POST | `/input/tap`                  | JSON `{"ok":true}` (查询参数或 JSON: `x`, `y`, `durationMs`, `sync`) |
 | GET/POST | `/input/swipe`                | JSON `{"ok":true}` (查询参数或 JSON: `x1`, `y1`, `x2`, `y2`, `durationMs`, `steps`, `holdMs`, `sync`) |
 | GET/POST | `/input/key`                  | JSON `{"ok":true}` (查询参数或 JSON: `keyCode`/`keyCodes`, `metaState`, `intervalMs`, `sync`) |
+| GET/POST | `/input/text`                 | JSON `{"ok":true}` (查询参数或 JSON: `text`, `clear`, `sync`; 支持 `KeyCharacterMap` 与 `ACTION_SET_TEXT`) |
 | GET/POST | `/input/global`               | JSON `{"ok":true}` (`action`: `back`, `home`, `recents`, `notifications`, `quick_settings`, `power_dialog`, `lock_screen`, `screenshot` 或数字 ID) |
-| POST     | `/input/batch`                | JSON `{"ok":true}` (JSON 请求体 `{"actions":[...],"sync":true}` 或 `[...]`; 支持 `down`/`move`/`up`/`tap`/`swipe`/`wait`/`key`/`global`) |
+| POST     | `/input/batch`                | JSON `{"ok":true}` (JSON 请求体 `{"actions":[...],"sync":true}` 或 `[...]`; 支持 `down`/`move`/`up`/`tap`/`swipe`/`wait`/`key`/`text`/`global`) |
 | GET      | `/packages?user_only=false`   | JSON 数组                                                         |
 | GET      | `/icon?pkg=<name>`            | `image/png`                                                       |
 | GET      | `/signature?pkg=<name>`       | 文本 (V1/V2/V3/V4 签名方案)                                       |
@@ -85,7 +86,7 @@ curl http://127.0.0.1:9500/health
 
 ## AXI 命令行工具与 Agent Skill
 
-`cli/` 提供了零外部依赖的 Python 3.10+ 命令行工具 (`android-agent`)，以 TOON 输出、HTTP/1.1 Keep-Alive 连接复用、严格参数校验和幂等启停封装了所有 AndroidAgent 接口（`start`、`stop`、`screen`、`ui`、`tap`、`swipe`、`key`、`global`、`batch`、`packages`、`package`、`signature`、`icon`、`device`）。
+`cli/` 提供了零外部依赖的 Python 3.10+ 命令行工具 (`android-agent`)，以 TOON 输出、HTTP/1.1 Keep-Alive 连接复用、严格参数校验和幂等启停封装了所有 AndroidAgent 接口（`start`、`stop`、`screen`、`ui`、`wait`、`tap`、`swipe`、`key`、`type`、`launch`、`global`、`batch`、`packages`、`package`、`signature`、`icon`、`device`）。
 
 ```sh
 pip install -e ./cli        # 将 `android-agent` 安装到 PATH

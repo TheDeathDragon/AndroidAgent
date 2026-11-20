@@ -60,26 +60,36 @@ def run_adb(
     if serial:
         cmd.extend(["-s", serial])
     cmd.extend(args)
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeAxiError(
-            f"adb timed out after {timeout}s",
-            help_hints=["Check USB connection and run `android-agent devices`"],
-        ) from exc
-    except OSError as exc:
-        raise RuntimeAxiError(
-            f"failed to execute adb: {exc}",
-            help_hints=["Verify Android Platform-Tools installation"],
-        ) from exc
+    for attempt in range(2):
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            if attempt == 0:
+                continue
+            raise RuntimeAxiError(
+                f"adb timed out after {timeout}s",
+                help_hints=["Check USB connection and run `android-agent devices`"],
+            ) from exc
+        except OSError as exc:
+            raise RuntimeAxiError(
+                f"failed to execute adb: {exc}",
+                help_hints=["Verify Android Platform-Tools installation"],
+            ) from exc
+
+        combined_err = f"{proc.stderr or ''}\n{proc.stdout or ''}".lower()
+        if proc.returncode != 0 and attempt == 0 and (
+            "protocol fault" in combined_err or "connection reset" in combined_err
+        ):
+            continue
+        break
 
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip() or f"exit code {proc.returncode}"
@@ -118,12 +128,12 @@ def parse_devices_output(output: str) -> list[AdbDevice]:
     return devices
 
 
-def list_devices(timeout: float = 5.0) -> list[AdbDevice]:
+def list_devices(timeout: float = 10.0) -> list[AdbDevice]:
     proc = run_adb(["devices", "-l"], timeout=timeout)
     return parse_devices_output(proc.stdout)
 
 
-def resolve_serial(requested: str | None, timeout: float = 5.0) -> str:
+def resolve_serial(requested: str | None, timeout: float = 10.0) -> str:
     if requested:
         return requested
     devices = list_devices(timeout=timeout)
@@ -192,7 +202,7 @@ def remote_file_size(serial: str, remote_path: str = REMOTE_JAR_PATH) -> int | N
     proc = run_adb(
         ["shell", f"stat -c %s {remote_path} 2>/dev/null || wc -c < {remote_path} 2>/dev/null"],
         serial=serial,
-        timeout=5.0,
+        timeout=10.0,
         check=False,
     )
     if proc.returncode != 0:
@@ -210,7 +220,7 @@ def remote_file_sha256(serial: str, remote_path: str = REMOTE_JAR_PATH) -> str |
     proc = run_adb(
         ["shell", f"sha256sum {remote_path} 2>/dev/null"],
         serial=serial,
-        timeout=5.0,
+        timeout=10.0,
         check=False,
     )
     if proc.returncode != 0:

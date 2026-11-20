@@ -1,7 +1,7 @@
 ---
 name: android-agent
 description: >
-  Control and inspect Android devices over ADB: start or stop AndroidAgent, capture screenshots, inspect UI hierarchy, tap or swipe UI elements, inject keys and batched gestures, and query installed apps, icons, signing schemes, and device hardware specs.
+  Control and inspect Android devices over ADB: start or stop AndroidAgent, capture screenshots, inspect or wait on UI hierarchy elements, tap, swipe, type text, inject keys and batched gestures, launch apps, and query installed packages, icons, signing schemes, and device hardware specs.
 ---
 
 # android-agent
@@ -178,6 +178,63 @@ android-agent key back
 android-agent key KEYCODE_DPAD_DOWN,enter --interval 80
 ```
 
+### `type` (aliases: `text`, `input-text`)
+
+Type or set text in the focused input or a matched UI element.
+
+Usage: `android-agent type [<text>] [--text STR | --id STR | --query STR] [--exact] [--index N] [--clear] [--submit] [--no-sync]`
+
+- `--text STR`: Tap matching element by text, content-desc, or hoisted label before typing
+- `--id STR`: Tap matching element by resource-id before typing
+- `--query STR`: Tap matching element by label, text, desc, or resource-id before typing
+- `--exact`: Require exact case-insensitive match for target selector
+- `--index N`: Disambiguate multi-match target selector by 0-based index
+- `--clear`: Replace/clear existing field text before typing
+- `--submit`: Send KEYCODE_ENTER after typing
+- `--no-sync`: Inject asynchronously (sync=false, fire-and-forget for lowest latency)
+
+```sh
+android-agent type "hello world"
+android-agent type "wifi" --id search_src_text --clear --submit
+android-agent type --clear
+```
+
+### `wait` (aliases: `wait-for`)
+
+Poll UI hierarchy over Keep-Alive until a matching element appears or disappears.
+
+Usage: `android-agent wait (--text STR | --id STR | --query STR) [--exact] [--gone] [--all] [--timeout 10] [--interval 250]`
+
+- `--text STR`: Match element by text, content-desc, or hoisted label
+- `--id STR`: Match element by resource-id
+- `--query STR`: Match element by label, text, desc, or resource-id
+- `--exact`: Require exact case-insensitive match
+- `--gone`: Wait until no matching element remains visible
+- `--all`: Include non-interactive nodes when matching
+- `--timeout SEC`: Maximum wait time in seconds (0.1..120, default: 10)
+- `--interval MS`: Polling interval in ms (50..5000, default: 250)
+
+```sh
+android-agent wait --text "Wi-Fi"
+android-agent wait --id loading_spinner --gone --timeout 15
+android-agent wait --query "Search" --all --interval 200
+```
+
+### `launch` (aliases: `open`, `start-app`)
+
+Launch an installed app by package name or explicit activity component.
+
+Usage: `android-agent launch <pkg> [--activity COMPONENT] [--stop] [--wait]`
+
+- `--activity COMPONENT`: Explicit activity component (e.g. com.android.settings/.Settings or .MainActivity)
+- `--stop`: Force-stop the package before launching
+- `--wait`: Pass -W to am start to wait for launch completion
+
+```sh
+android-agent launch com.android.settings
+android-agent launch com.android.chrome --stop --wait
+```
+
 ### `global`
 
 Perform an Android AccessibilityService global action.
@@ -310,7 +367,8 @@ android-agent skill --check
 
 - `start` and `stop` are idempotent and exit 0 when already in the target state; `start` verifies the on-device JAR by SHA-256 before skipping push.
 - `screen` defaults to `--fast --format jpeg --quality 80 --scale 0.5` (Android 10+ VirtualDisplay mirror, with `frameVersion` encoding cache reported as `cache_hit: true` when the frame is unchanged); `--crop X,Y,W,H` uses scaled image pixels, while `tap` and `swipe` always use native screen pixels.
-- `tap`, `swipe`, `key`, and `batch` use direct `InputManager` injection (`source: direct`) with automatic `UiAutomation` fallback (`source: uiautomation`); pass `--no-sync` for lowest-latency fire-and-forget actions.
-- `tap --text/--id/--query` finds and taps a UI element over one Keep-Alive connection, walking up to clickable ancestors and returning an inline candidate table on ambiguous matches.
+- `tap`, `swipe`, `key`, `type`, and `batch` use direct `InputManager` injection (`source: direct`) with automatic `UiAutomation` fallback (`source: uiautomation`); `type` uses `ACTION_SET_TEXT` on focused editable nodes when `--clear` or Unicode text is given.
+- `tap` and `type` accept `--text/--id/--query` to find and tap a UI element over one Keep-Alive connection, walking up to clickable ancestors and returning an inline candidate table on ambiguous matches.
+- `wait` polls `/hierarchy` over a single Keep-Alive connection until a selector appears (or disappears with `--gone`), avoiding multi-turn shell polling loops.
 - `ui` defaults to interactive nodes with container label hoisting; pass `--all` for every node or `--xml` for raw hierarchy XML.
 - Run `android-agent setup` to install ambient `SessionStart` hooks for Claude Code, Codex, and OpenCode.

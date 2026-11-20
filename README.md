@@ -61,8 +61,9 @@ All endpoints support HTTP/1.1 Keep-Alive (up to 1000 requests per connection, 1
 | GET/POST | `/input/tap`                  | JSON `{"ok":true}` (params or JSON: `x`, `y`, `durationMs`, `sync`) |
 | GET/POST | `/input/swipe`                | JSON `{"ok":true}` (params or JSON: `x1`, `y1`, `x2`, `y2`, `durationMs`, `steps`, `holdMs`, `sync`) |
 | GET/POST | `/input/key`                  | JSON `{"ok":true}` (params or JSON: `keyCode`/`keyCodes`, `metaState`, `intervalMs`, `sync`) |
+| GET/POST | `/input/text`                 | JSON `{"ok":true}` (params or JSON: `text`, `clear`, `sync`; uses `KeyCharacterMap` or `ACTION_SET_TEXT`) |
 | GET/POST | `/input/global`               | JSON `{"ok":true}` (`action`: `back`, `home`, `recents`, `notifications`, `quick_settings`, `power_dialog`, `lock_screen`, `screenshot`, or numeric id) |
-| POST     | `/input/batch`                | JSON `{"ok":true}` (JSON body `{"actions":[...],"sync":true}` or `[...]`; types: `down`, `move`, `up`, `tap`, `swipe`, `wait`, `key`, `global`) |
+| POST     | `/input/batch`                | JSON `{"ok":true}` (JSON body `{"actions":[...],"sync":true}` or `[...]`; types: `down`, `move`, `up`, `tap`, `swipe`, `wait`, `key`, `text`, `global`) |
 | GET      | `/packages?user_only=false`   | JSON array                                                        |
 | GET      | `/icon?pkg=<name>`            | `image/png`                                                       |
 | GET      | `/signature?pkg=<name>`       | text (V1/V2/V3/V4 schemes)                                        |
@@ -86,7 +87,7 @@ All endpoints support HTTP/1.1 Keep-Alive (up to 1000 requests per connection, 1
 
 ## AXI CLI & Agent Skill
 
-`cli/` ships a zero-dependency Python 3.10+ CLI (`android-agent`) that wraps every AndroidAgent endpoint with TOON output, persistent HTTP/1.1 Keep-Alive, strict validation, and idempotent lifecycle commands (`start`, `stop`, `screen`, `ui`, `tap`, `swipe`, `key`, `global`, `batch`, `packages`, `package`, `signature`, `icon`, `device`).
+`cli/` ships a zero-dependency Python 3.10+ CLI (`android-agent`) that wraps every AndroidAgent endpoint with TOON output, persistent HTTP/1.1 Keep-Alive, strict validation, and idempotent lifecycle commands (`start`, `stop`, `screen`, `ui`, `wait`, `tap`, `swipe`, `key`, `type`, `launch`, `global`, `batch`, `packages`, `package`, `signature`, `icon`, `device`).
 
 ```sh
 pip install -e ./cli        # installs `android-agent` on PATH

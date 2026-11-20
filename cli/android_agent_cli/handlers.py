@@ -30,7 +30,7 @@ from .spec import (
     render_skill_md,
 )
 from .toon import truncate_text
-from .ui_parser import UiNode, filter_ui_nodes, parse_hierarchy_xml, resolve_tap_targets
+from .ui_parser import UiNode, filter_ui_nodes, node_matches, parse_hierarchy_xml, resolve_tap_targets
 
 _KEYCODE_NAME_RE = re.compile(r"^KEYCODE_[A-Z0-9_]+$")
 _XML_TRUNCATE_LIMIT = 2000
@@ -741,6 +741,244 @@ def handle_key(inv: ParsedInvocation) -> dict[str, Any]:
     return result
 
 
+def handle_type(inv: ParsedInvocation) -> dict[str, Any]:
+    prefix = _cli_prefix(inv.globals)
+    pos = inv.positionals
+    clear: bool = inv.flags["clear"]
+    submit: bool = inv.flags["submit"]
+    sync: bool = not inv.flags["no_sync"]
+    text_sel: str | None = inv.flags["text"]
+    id_sel: str | None = inv.flags["id"]
+    query_sel: str | None = inv.flags["query"]
+    exact: bool = inv.flags["exact"]
+    index: int | None = inv.flags["index"]
+
+    text_val = pos[0] if pos else ""
+    if not text_val and not clear:
+        raise UsageError(
+            "type requires a <text> argument unless --clear is set",
+            help_hints=[
+                f'Use `{prefix} type "hello"` or `{prefix} type --clear`',
+            ],
+        )
+    if len(text_val) > 4096:
+        raise UsageError("text length exceeds maximum 4096 characters")
+
+    has_selector = any(v is not None for v in (text_sel, id_sel, query_sel))
+    if not has_selector and (exact or index is not None):
+        raise UsageError(
+            "--exact and --index are only valid with --text/--id/--query",
+            help_hints=[f'Use `{prefix} type "{text_val}" --id <res_id>`'],
+        )
+
+    tapped_node: UiNode | None = None
+    with _make_client(inv.globals) as client:
+        if has_selector:
+            xml_text = client.get_hierarchy(compressed=True)
+            snapshot = parse_hierarchy_xml(xml_text)
+            targets = resolve_tap_targets(
+                snapshot,
+                query=query_sel,
+                text=text_sel,
+                res_id=id_sel,
+                exact=exact,
+            )
+            if not targets:
+                desc = _selector_desc(text_sel, id_sel, query_sel)
+                raise RuntimeAxiError(
+                    f"no UI element matched {desc}",
+                    help_hints=[f"Run `{prefix} ui` to inspect visible interactive elements"],
+                )
+            if len(targets) > 1 and index is None:
+                candidates = [_candidate_row(i, node) for i, node in enumerate(targets)]
+                desc = _selector_desc(text_sel, id_sel, query_sel)
+                raise RuntimeAxiError(
+                    f"{len(targets)} UI elements matched {desc}; pass --index <N>",
+                    details={"candidates": candidates},
+                    help_hints=[f"Re-run with `--index 0` .. `--index {len(targets) - 1}` or `--exact`"],
+                )
+            chosen_idx = 0 if index is None else index
+            if chosen_idx < 0 or chosen_idx >= len(targets):
+                candidates = [_candidate_row(i, node) for i, node in enumerate(targets)]
+                raise RuntimeAxiError(
+                    f"--index {chosen_idx} out of range (0..{len(targets) - 1})",
+                    details={"candidates": candidates},
+                    help_hints=[f"Pass `--index` between 0 and {len(targets) - 1}"],
+                )
+            tapped_node = targets[chosen_idx]
+            client.post_tap(float(tapped_node.cx), float(tapped_node.cy), duration_ms=0, sync=True)
+
+        resp = client.post_text(text_val, clear=clear, sync=sync and not submit)
+        ok = bool(resp.get("ok", False))
+        source = resp.get("source")
+        if submit and ok:
+            sub_resp = client.post_key([66], sync=sync)
+            ok = ok and bool(sub_resp.get("ok", False))
+
+    result: dict[str, Any] = {
+        "ok": ok,
+        "text": text_val,
+        "clear": clear,
+    }
+    if submit:
+        result["submit"] = True
+    if tapped_node is not None:
+        result["x"] = tapped_node.cx
+        result["y"] = tapped_node.cy
+        result["target"] = tapped_node.label or tapped_node.res_id or "-"
+    if source:
+        result["source"] = source
+    return result
+
+
+def handle_wait(inv: ParsedInvocation) -> dict[str, Any]:
+    prefix = _cli_prefix(inv.globals)
+    text_sel: str | None = inv.flags["text"]
+    id_sel: str | None = inv.flags["id"]
+    query_sel: str | None = inv.flags["query"]
+    exact: bool = inv.flags["exact"]
+    gone: bool = inv.flags["gone"]
+    include_all: bool = inv.flags["all"]
+    timeout_s: float = inv.flags["timeout"]
+    interval_ms: int = inv.flags["interval"]
+
+    if not any(v is not None for v in (text_sel, id_sel, query_sel)):
+        raise UsageError(
+            "wait requires at least one selector (--text, --id, or --query)",
+            help_hints=[
+                f'Use `{prefix} wait --text "Wi-Fi"` or `{prefix} wait --id loading --gone`',
+            ],
+        )
+
+    desc = _selector_desc(text_sel, id_sel, query_sel)
+    start_t = time.monotonic()
+    deadline = start_t + timeout_s
+    polls = 0
+
+    with _make_client(inv.globals, timeout=max(10.0, timeout_s + 5.0)) as client:
+        while True:
+            polls += 1
+            xml_text = client.get_hierarchy(compressed=True)
+            snapshot = parse_hierarchy_xml(xml_text)
+            candidates = snapshot.nodes if include_all else [n for n in snapshot.nodes if n.has_area]
+            matched = [
+                n
+                for n in candidates
+                if node_matches(n, query=query_sel, text=text_sel, res_id=id_sel, exact=exact)
+            ]
+            elapsed_ms = round((time.monotonic() - start_t) * 1000)
+
+            if gone:
+                if not matched:
+                    return {
+                        "status": "gone",
+                        "selector": desc,
+                        "elapsedMs": elapsed_ms,
+                        "polls": polls,
+                    }
+            else:
+                if matched:
+                    rows = [node.to_row(idx, UI_DEFAULT_FIELDS) for idx, node in enumerate(matched[:10])]
+                    return {
+                        "status": "matched",
+                        "selector": desc,
+                        "elapsedMs": elapsed_ms,
+                        "polls": polls,
+                        "count": len(matched),
+                        "nodes": rows,
+                    }
+
+            now = time.monotonic()
+            if now >= deadline:
+                state_word = "disappear" if gone else "appear"
+                raise RuntimeAxiError(
+                    f"timed out after {timeout_s:g}s ({polls} polls) waiting for {desc} to {state_word}",
+                    help_hints=[
+                        f"Run `{prefix} ui` or `{prefix} screen` to inspect the current screen",
+                    ],
+                )
+            sleep_s = min(interval_ms / 1000.0, max(0.01, deadline - now))
+            time.sleep(sleep_s)
+
+
+def handle_launch(inv: ParsedInvocation) -> dict[str, Any]:
+    prefix = _cli_prefix(inv.globals)
+    pkg_name = inv.positionals[0].strip()
+    if not pkg_name or any(ch.isspace() for ch in pkg_name):
+        raise UsageError(f"invalid package name: {inv.positionals[0]}")
+    activity_override: str | None = inv.flags["activity"]
+    stop_first: bool = inv.flags["stop"]
+    wait_launch: bool = inv.flags["wait"]
+
+    component: str | None = None
+    if activity_override:
+        act = activity_override.strip()
+        if "/" in act:
+            component = act
+        elif act.startswith("."):
+            component = f"{pkg_name}/{act}"
+        else:
+            component = f"{pkg_name}/{act}"
+    else:
+        try:
+            with _make_client(inv.globals, timeout=10.0) as client:
+                pkgs = client.get_packages(user_only=False)
+            found = next((p for p in pkgs if p.get("packageName") == pkg_name), None)
+            if found is None:
+                raise RuntimeAxiError(
+                    f"package not found: {pkg_name}",
+                    help_hints=[f"Run `{prefix} packages --query {pkg_name}` to search installed packages"],
+                )
+            main_act = found.get("mainActivity")
+            if isinstance(main_act, str) and main_act.strip():
+                component = main_act.strip()
+        except RuntimeAxiError as exc:
+            if "package not found:" in exc.message:
+                raise
+
+    serial = adb.resolve_serial(inv.globals["serial"])
+    if stop_first:
+        adb.run_adb(["shell", f"am force-stop {pkg_name}"], serial=serial, timeout=10.0)
+
+    if component:
+        wait_flag = "-W " if wait_launch else ""
+        proc = adb.run_adb(
+            ["shell", f"am start {wait_flag}-n {component}"],
+            serial=serial,
+            timeout=20.0,
+        )
+        out_text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if "Error:" in out_text or "Exception" in out_text:
+            raise RuntimeAxiError(
+                f"failed to launch {component}: {out_text.strip()}",
+                help_hints=[f"Run `{prefix} package {pkg_name}` to inspect package details"],
+            )
+        return {
+            "status": "launched",
+            "package": pkg_name,
+            "component": component,
+            "stopped_first": stop_first,
+        }
+
+    proc = adb.run_adb(
+        ["shell", f"monkey -p {pkg_name} -c android.intent.category.LAUNCHER 1"],
+        serial=serial,
+        timeout=15.0,
+    )
+    out_text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if "No activities found" in out_text or "aborted" in out_text.lower():
+        raise RuntimeAxiError(
+            f"package {pkg_name} has no launchable activity",
+            help_hints=[f"Pass `--activity <COMPONENT>` or inspect `{prefix} package {pkg_name}`"],
+        )
+    return {
+        "status": "launched",
+        "package": pkg_name,
+        "component": "launcher-intent",
+        "stopped_first": stop_first,
+    }
+
+
 def _validate_global_action(raw: str) -> str | int:
     trimmed = raw.strip()
     lower = trimmed.lower()
@@ -836,7 +1074,7 @@ def validate_batch_payload(raw_text: str, sync_override: bool | None = None) -> 
     if not (1 <= len(actions) <= 256):
         raise UsageError(f"batch actions count must be in 1..256 (got {len(actions)})")
 
-    valid_types = ("down", "move", "up", "tap", "swipe", "wait", "key", "global")
+    valid_types = ("down", "move", "up", "tap", "swipe", "wait", "key", "text", "global")
     touch_down = False
     for idx, item in enumerate(actions):
         if not isinstance(item, dict):
@@ -894,6 +1132,20 @@ def validate_batch_payload(raw_text: str, sync_override: bool | None = None) -> 
             if not has_key:
                 raise UsageError(f"batch action[{idx}] `key` requires `keyCode` or `keyCodes`")
             _optional_batch_int(item, ("interval", "intervalMs"), idx, 0, 30000)
+        elif act_type == "text":
+            clear_val = item.get("clear", False)
+            if not isinstance(clear_val, bool):
+                raise UsageError(f"batch action[{idx}] `clear` must be a boolean")
+            raw_text_val = item.get("text")
+            if raw_text_val is None:
+                if not clear_val:
+                    raise UsageError(f"batch action[{idx}] `text` requires `text` field unless `clear` is true")
+            elif not isinstance(raw_text_val, str):
+                raise UsageError(f"batch action[{idx}] `text` must be a string")
+            elif not raw_text_val and not clear_val:
+                raise UsageError(f"batch action[{idx}] `text` cannot be empty unless `clear` is true")
+            elif len(raw_text_val) > 4096:
+                raise UsageError(f"batch action[{idx}] `text` exceeds 4096 characters")
         elif act_type == "global":
             if "action" not in item or item["action"] is None:
                 raise UsageError(f"batch action[{idx}] `global` requires `action`")
@@ -1305,6 +1557,9 @@ DISPATCH_TABLE = {
     "tap": handle_tap,
     "swipe": handle_swipe,
     "key": handle_key,
+    "type": handle_type,
+    "wait": handle_wait,
+    "launch": handle_launch,
     "global": handle_global,
     "batch": handle_batch,
     "packages": handle_packages,
