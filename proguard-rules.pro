@@ -5,3 +5,6 @@
 
 # Keep BuildConfig for version info
 -keep class la.shiro.agent.BuildConfig { *; }
+
+# Prevent R8 from inlining API 34+ hidden API calls into classes loaded on API 30-33
+-keep class la.shiro.agent.VirtualDisplayFactory { *; }

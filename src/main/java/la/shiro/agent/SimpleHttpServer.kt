@@ -84,6 +84,7 @@ class SimpleHttpServer(
                 try { socket.close() } catch (_: Throwable) {}
             }
             activeSockets.clear()
+            try { screenCapture.close() } catch (_: Throwable) {}
             executor.shutdown()
         } finally {
             stoppedLatch.countDown()
@@ -227,9 +228,20 @@ class SimpleHttpServer(
         keepAlive: Boolean,
         headOnly: Boolean
     ) {
-        val quality: Int = request.query["quality"]?.toIntOrNull() ?: 100
-        val png: ByteArray? = try {
-            screenCapture.capture(quality)
+        val captureRequest = try {
+            CaptureRequest.parse(request.query)
+        } catch (e: BadRequestException) {
+            HttpProtocol.writeResponse(
+                output,
+                HttpResponse.text(HttpStatus.BAD_REQUEST, e.message ?: "bad request"),
+                keepAlive = keepAlive,
+                headOnly = headOnly
+            )
+            return
+        }
+
+        val result = try {
+            screenCapture.capture(captureRequest)
         } catch (e: Throwable) {
             System.err.println("[Agent] Screenshot failed: ${e.message}")
             HttpProtocol.writeResponse(
@@ -240,12 +252,28 @@ class SimpleHttpServer(
             )
             return
         }
-        val response = if (png != null) {
-            HttpResponse.bytes(HttpStatus.OK, png, "image/png")
-        } else {
-            HttpResponse.text(HttpStatus.INTERNAL_SERVER_ERROR, "screenshot returned null")
+
+        if (result == null) {
+            HttpProtocol.writeResponse(
+                output,
+                HttpResponse.text(HttpStatus.INTERNAL_SERVER_ERROR, "screenshot returned null"),
+                keepAlive = keepAlive,
+                headOnly = headOnly
+            )
+            return
         }
-        HttpProtocol.writeResponse(output, response, keepAlive = keepAlive, headOnly = headOnly)
+
+        result.use { captured ->
+            val response = HttpResponse.bytes(
+                status = HttpStatus.OK,
+                data = captured.buffer,
+                contentType = captured.format.mimeType,
+                headers = captured.toHeaders(),
+                offset = 0,
+                length = captured.length
+            )
+            HttpProtocol.writeResponse(output, response, keepAlive = keepAlive, headOnly = headOnly)
+        }
     }
 
     private fun handleHierarchy(params: Map<String, String>): HttpResponse {
