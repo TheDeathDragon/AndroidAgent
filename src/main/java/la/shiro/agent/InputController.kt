@@ -117,9 +117,23 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
             return try {
                 (method.invoke(receiver, event, mode) as? Boolean) ?: false
             } catch (t: Throwable) {
-                disablePermanently(t)
+                val cause = if (t is InvocationTargetException) t.cause ?: t else t
+                if (isPermanentFailure(cause)) {
+                    disablePermanently(cause)
+                }
                 null
             }
+        }
+
+        private fun isPermanentFailure(cause: Throwable): Boolean {
+            return cause is SecurityException ||
+                cause is NoSuchMethodError ||
+                cause is NoSuchMethodException ||
+                cause is NoSuchFieldError ||
+                cause is NoClassDefFoundError ||
+                cause is ClassNotFoundException ||
+                cause is IllegalAccessException ||
+                cause is UnsupportedOperationException
         }
 
         private fun ensureInitialized(): Boolean {
