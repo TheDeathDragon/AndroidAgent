@@ -43,6 +43,7 @@ class SimpleHttpServer(
 
     private val uiHierarchy: UiHierarchy = UiHierarchy(uiAutomation)
     private val screenCapture: ScreenCapture = ScreenCapture(uiAutomation)
+    private val inputController: InputController = InputController(uiAutomation)
     private val packageService: PackageService = PackageService(context)
     private val deviceInfo: DeviceInfo = DeviceInfo(context)
 
@@ -84,6 +85,7 @@ class SimpleHttpServer(
                 try { socket.close() } catch (_: Throwable) {}
             }
             activeSockets.clear()
+            try { inputController.close() } catch (_: Throwable) {}
             try { screenCapture.close() } catch (_: Throwable) {}
             executor.shutdown()
         } finally {
@@ -218,6 +220,11 @@ class SimpleHttpServer(
             "/icon" -> handleIcon(request.query)
             "/info" -> handleInfo()
             "/device-info" -> handleDeviceInfo()
+            "/input/tap" -> handleInputTap(request)
+            "/input/swipe" -> handleInputSwipe(request)
+            "/input/key" -> handleInputKey(request)
+            "/input/global" -> handleInputGlobal(request)
+            "/input/batch" -> handleInputBatch(request)
             else -> HttpResponse.text(HttpStatus.NOT_FOUND, "not found: ${request.path}")
         }
     }
@@ -325,6 +332,47 @@ class SimpleHttpServer(
     private fun handleDeviceInfo(): HttpResponse {
         val json: String = deviceInfo.buildJson()
         return HttpResponse.text(HttpStatus.OK, json, "application/json; charset=utf-8")
+    }
+
+    private fun handleInputTap(request: HttpRequest): HttpResponse {
+        val command = InputController.parseTap(request)
+        val ok = inputController.execute(command)
+        return inputResultResponse(ok)
+    }
+
+    private fun handleInputSwipe(request: HttpRequest): HttpResponse {
+        val command = InputController.parseSwipe(request)
+        val ok = inputController.execute(command)
+        return inputResultResponse(ok)
+    }
+
+    private fun handleInputKey(request: HttpRequest): HttpResponse {
+        val command = InputController.parseKey(request)
+        val ok = inputController.execute(command)
+        return inputResultResponse(ok)
+    }
+
+    private fun handleInputGlobal(request: HttpRequest): HttpResponse {
+        val command = InputController.parseGlobal(request)
+        val ok = inputController.execute(command)
+        return inputResultResponse(ok)
+    }
+
+    private fun handleInputBatch(request: HttpRequest): HttpResponse {
+        if (request.method != HttpMethod.POST) {
+            throw MethodNotAllowedException("batch requires POST", "POST")
+        }
+        val batch = InputController.parseBatch(request)
+        val ok = inputController.executeBatch(batch)
+        return inputResultResponse(ok)
+    }
+
+    private fun inputResultResponse(ok: Boolean): HttpResponse {
+        return HttpResponse.text(
+            HttpStatus.OK,
+            if (ok) """{"ok":true}""" else """{"ok":false}""",
+            "application/json; charset=utf-8"
+        )
     }
 
     private fun writeSafe(output: BufferedOutputStream, response: HttpResponse, keepAlive: Boolean) {
