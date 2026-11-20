@@ -2,15 +2,23 @@ package la.shiro.agent
 
 import android.app.UiAutomation
 import android.content.Context
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.io.OutputStream
+import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.URLDecoder
-import java.util.concurrent.Executors
+import java.net.SocketException
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class SimpleHttpServer(
     private val port: Int,
@@ -19,8 +27,20 @@ class SimpleHttpServer(
 ) {
 
     private val running: AtomicBoolean = AtomicBoolean(false)
-    private val executor = Executors.newFixedThreadPool(4)
+    private val stopInitiated: AtomicBoolean = AtomicBoolean(false)
+    private val stoppedLatch: CountDownLatch = CountDownLatch(1)
+    private val activeSockets: MutableSet<Socket> = Collections.newSetFromMap(ConcurrentHashMap())
+    private val executor: ThreadPoolExecutor = ThreadPoolExecutor(
+        CORE_WORKERS,
+        MAX_WORKERS,
+        WORKER_KEEP_ALIVE_SECONDS,
+        TimeUnit.SECONDS,
+        SynchronousQueue(),
+        daemonThreadFactory("HttpWorker")
+    )
+    @Volatile
     private var serverSocket: ServerSocket? = null
+
     private val uiHierarchy: UiHierarchy = UiHierarchy(uiAutomation)
     private val screenCapture: ScreenCapture = ScreenCapture(uiAutomation)
     private val packageService: PackageService = PackageService(context)
@@ -29,238 +49,280 @@ class SimpleHttpServer(
     val isAlive: Boolean get() = running.get()
 
     fun start() {
+        val socket = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
+        serverSocket = socket
         running.set(true)
         Thread({
-            // Bind to the loopback interface only. adb forward on the host
-            // tunnels to adbd, which connects on-device via 127.0.0.1, so this
-            // keeps the endpoints working while blocking same-network peers
-            // from reaching /screenshot, /hierarchy, /packages etc.
-            val socket = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
-            serverSocket = socket
-            while (running.get()) {
-                try {
-                    val client: Socket = socket.accept()
-                    executor.submit { handleClient(client) }
-                } catch (e: Throwable) {
-                    if (running.get()) {
-                        System.err.println("[Agent] Accept error: ${e.message}")
+            try {
+                while (running.get()) {
+                    val client: Socket = try {
+                        socket.accept()
+                    } catch (e: Throwable) {
+                        if (running.get()) {
+                            System.err.println("[Agent] Accept error: ${e.message}")
+                        }
+                        continue
+                    }
+                    try {
+                        executor.execute { handleClient(client) }
+                    } catch (_: RejectedExecutionException) {
+                        rejectBusyClient(client)
                     }
                 }
+            } finally {
+                stop()
             }
         }, "HttpServerThread").start()
     }
 
     fun stop() {
+        if (!stopInitiated.compareAndSet(false, true)) return
         running.set(false)
-        serverSocket?.close()
-        executor.shutdown()
+        try {
+            try { serverSocket?.close() } catch (_: Throwable) {}
+            for (socket in activeSockets.toList()) {
+                try { socket.close() } catch (_: Throwable) {}
+            }
+            activeSockets.clear()
+            executor.shutdown()
+        } finally {
+            stoppedLatch.countDown()
+        }
+    }
+
+    fun awaitStop() {
+        stoppedLatch.await()
+    }
+
+    private fun rejectBusyClient(client: Socket) {
+        try {
+            client.use { socket ->
+                socket.soTimeout = 2_000
+                socket.tcpNoDelay = true
+                val out = BufferedOutputStream(socket.getOutputStream(), 1024)
+                val response = HttpResponse.text(HttpStatus.SERVICE_UNAVAILABLE, "server busy")
+                HttpProtocol.writeResponse(out, response, keepAlive = false)
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     private fun handleClient(socket: Socket) {
-        socket.use { client ->
-            try {
-                client.soTimeout = 30_000
-                val input = BufferedReader(InputStreamReader(client.getInputStream()))
-                val requestLine: String = input.readLine() ?: return
-                val parts: List<String> = requestLine.split(" ")
-                if (parts.size < 2) return
-                val method: String = parts[0]
-                val fullPath: String = parts[1]
-                val pathAndQuery: Pair<String, String> = splitPathAndQuery(fullPath)
-                val path: String = pathAndQuery.first
-                val params: Map<String, String> = parseQueryParams(pathAndQuery.second)
-                consumeHeaders(input)
-                val output: OutputStream = client.getOutputStream()
-                route(method, path, params, output)
-            } catch (e: Throwable) {
+        activeSockets.add(socket)
+        try {
+            socket.use { client ->
+                client.tcpNoDelay = true
+                val input = BufferedInputStream(client.getInputStream())
+                val output = BufferedOutputStream(client.getOutputStream(), OUTPUT_BUFFER_BYTES)
+                var requestsHandled = 0
+
+                while (running.get() && requestsHandled < MAX_REQUESTS_PER_CONN) {
+                    val request: HttpRequest = try {
+                        HttpProtocol.readRequest(input, client, IDLE_TIMEOUT_MS, ACTIVE_TIMEOUT_MS)
+                            ?: break
+                    } catch (e: PayloadTooLargeException) {
+                        writeSafe(
+                            output,
+                            HttpResponse.text(HttpStatus.PAYLOAD_TOO_LARGE, e.message ?: "payload too large"),
+                            keepAlive = false
+                        )
+                        break
+                    } catch (e: MethodNotAllowedException) {
+                        val headers = e.allow?.let { mapOf("Allow" to it) } ?: emptyMap()
+                        writeSafe(
+                            output,
+                            HttpResponse.text(
+                                HttpStatus.METHOD_NOT_ALLOWED,
+                                e.message ?: "method not allowed",
+                                headers = headers
+                            ),
+                            keepAlive = false
+                        )
+                        break
+                    } catch (e: BadRequestException) {
+                        writeSafe(
+                            output,
+                            HttpResponse.text(HttpStatus.BAD_REQUEST, e.message ?: "bad request"),
+                            keepAlive = false
+                        )
+                        break
+                    }
+
+                    requestsHandled++
+                    val keepAlive = request.keepAlive &&
+                        running.get() &&
+                        requestsHandled < MAX_REQUESTS_PER_CONN &&
+                        activeSockets.size <= MAX_KEEP_ALIVE_SOCKETS
+
+                    val shouldContinue = dispatch(request, output, keepAlive)
+                    if (!shouldContinue || !keepAlive) break
+                }
+            }
+        } catch (_: SocketException) {
+        } catch (e: Throwable) {
+            if (running.get()) {
                 System.err.println("[Agent] Handle error: ${e.message}")
             }
+        } finally {
+            activeSockets.remove(socket)
         }
     }
 
-    private fun route(method: String, path: String, params: Map<String, String>, output: OutputStream) {
-        when (path) {
-            "/health" -> respondText(output, 200, "ok")
-            "/hierarchy" -> handleHierarchy(params, output)
-            "/screenshot" -> handleScreenshot(params, output)
-            "/packages" -> handlePackages(params, output)
-            "/signature" -> handleSignature(params, output)
-            "/icon" -> handleIcon(params, output)
-            "/info" -> handleInfo(output)
-            "/device-info" -> handleDeviceInfo(output)
-            "/stop" -> {
-                respondText(output, 200, "stopping")
-                stop()
+    private fun dispatch(
+        request: HttpRequest,
+        output: BufferedOutputStream,
+        keepAlive: Boolean
+    ): Boolean {
+        val headOnly = request.method == HttpMethod.HEAD
+        if (request.path == "/stop") {
+            val response = HttpResponse.text(HttpStatus.OK, "stopping")
+            HttpProtocol.writeResponse(output, response, keepAlive = false, headOnly = headOnly)
+            Thread({ stop() }, "HttpStopThread").apply {
+                isDaemon = true
+                start()
             }
-            else -> respondText(output, 404, "not found: $path")
+            return false
         }
-    }
+        if (request.path == "/screenshot") {
+            handleScreenshot(request, output, keepAlive, headOnly)
+            return true
+        }
 
-    private fun handleHierarchy(params: Map<String, String>, output: OutputStream) {
-        try {
-            val compressed: Boolean = params["compressed"]?.toBooleanStrictOrNull() ?: true
-            val xml: String = uiHierarchy.dump(compressed)
-            respondText(output, 200, xml, "application/xml; charset=utf-8")
+        val response: HttpResponse = try {
+            route(request)
+        } catch (e: BadRequestException) {
+            HttpResponse.text(HttpStatus.BAD_REQUEST, e.message ?: "bad request")
+        } catch (e: MethodNotAllowedException) {
+            val headers = e.allow?.let { mapOf("Allow" to it) } ?: emptyMap()
+            HttpResponse.text(
+                HttpStatus.METHOD_NOT_ALLOWED,
+                e.message ?: "method not allowed",
+                headers = headers
+            )
         } catch (e: Throwable) {
-            System.err.println("[Agent] Hierarchy dump failed: ${e.message}")
-            respondText(output, 500, "hierarchy dump failed: ${e.message}")
+            System.err.println("[Agent] Route ${request.path} failed: ${e.message}")
+            HttpResponse.text(HttpStatus.INTERNAL_SERVER_ERROR, "${request.path} failed: ${e.message}")
+        }
+
+        HttpProtocol.writeResponse(output, response, keepAlive = keepAlive, headOnly = headOnly)
+        return true
+    }
+
+    private fun route(request: HttpRequest): HttpResponse {
+        return when (request.path) {
+            "/health" -> HttpResponse.text(HttpStatus.OK, "ok")
+            "/hierarchy" -> handleHierarchy(request.query)
+            "/packages" -> handlePackages(request.query)
+            "/signature" -> handleSignature(request.query)
+            "/icon" -> handleIcon(request.query)
+            "/info" -> handleInfo()
+            "/device-info" -> handleDeviceInfo()
+            else -> HttpResponse.text(HttpStatus.NOT_FOUND, "not found: ${request.path}")
         }
     }
 
-    private fun handleScreenshot(params: Map<String, String>, output: OutputStream) {
-        try {
-            val quality: Int = params["quality"]?.toIntOrNull() ?: 100
-            val png: ByteArray? = screenCapture.capture(quality)
-            if (png != null) {
-                respondBinary(output, 200, png, "image/png")
-            } else {
-                respondText(output, 500, "screenshot returned null")
-            }
+    private fun handleScreenshot(
+        request: HttpRequest,
+        output: BufferedOutputStream,
+        keepAlive: Boolean,
+        headOnly: Boolean
+    ) {
+        val quality: Int = request.query["quality"]?.toIntOrNull() ?: 100
+        val png: ByteArray? = try {
+            screenCapture.capture(quality)
         } catch (e: Throwable) {
             System.err.println("[Agent] Screenshot failed: ${e.message}")
-            respondText(output, 500, "screenshot failed: ${e.message}")
-        }
-    }
-
-    private fun handlePackages(params: Map<String, String>, output: OutputStream) {
-        try {
-            val userOnly: Boolean = params["user_only"]?.toBooleanStrictOrNull() ?: false
-            val json: String = packageService.listPackages(userOnly)
-            respondText(output, 200, json, "application/json; charset=utf-8")
-        } catch (e: Throwable) {
-            System.err.println("[Agent] Package list failed: ${e.message}")
-            respondText(output, 500, "package list failed: ${e.message}")
-        }
-    }
-
-    private fun handleSignature(params: Map<String, String>, output: OutputStream) {
-        val packageName: String? = params["pkg"]
-        if (packageName.isNullOrEmpty()) {
-            respondText(output, 400, "missing pkg parameter")
+            HttpProtocol.writeResponse(
+                output,
+                HttpResponse.text(HttpStatus.INTERNAL_SERVER_ERROR, "screenshot failed: ${e.message}"),
+                keepAlive = keepAlive,
+                headOnly = headOnly
+            )
             return
         }
-        try {
-            val schemes: String = packageService.getSigningSchemes(packageName)
-            respondText(output, 200, schemes, "text/plain; charset=utf-8")
-        } catch (e: Throwable) {
-            System.err.println("[Agent] Signature scan failed for $packageName: $e")
-            respondText(output, 500, "signature failed: ${e.message}")
-        }
-    }
-
-    private fun handleIcon(params: Map<String, String>, output: OutputStream) {
-        val packageName: String? = params["pkg"]
-        if (packageName.isNullOrEmpty()) {
-            respondText(output, 400, "missing pkg parameter")
-            return
-        }
-        try {
-            val png: ByteArray? = packageService.getIcon(packageName)
-            if (png != null) {
-                respondBinary(output, 200, png, "image/png")
-            } else {
-                respondText(output, 404, "icon not found")
-            }
-        } catch (e: Throwable) {
-            System.err.println("[Agent] Icon load failed: ${e.message}")
-            respondText(output, 500, "icon failed: ${e.message}")
-        }
-    }
-
-    private fun handleInfo(output: OutputStream) {
-        try {
-            val json: String = buildDeviceInfoJson()
-            respondText(output, 200, json, "application/json; charset=utf-8")
-        } catch (e: Throwable) {
-            respondText(output, 500, "info failed: ${e.message}")
-        }
-    }
-
-    private fun handleDeviceInfo(output: OutputStream) {
-        try {
-            val json: String = deviceInfo.buildJson()
-            respondText(output, 200, json, "application/json; charset=utf-8")
-        } catch (e: Throwable) {
-            System.err.println("[Agent] Device info build failed: ${e.message}")
-            respondText(output, 500, "device-info failed: ${e.message}")
-        }
-    }
-
-    private fun buildDeviceInfoJson(): String {
-        val brand: String = android.os.Build.BRAND
-        val model: String = android.os.Build.MODEL
-        val sdk: Int = android.os.Build.VERSION.SDK_INT
-        val release: String = android.os.Build.VERSION.RELEASE
-        val version: String = BuildConfig.VERSION_NAME
-        val versionCode: Int = BuildConfig.VERSION_CODE
-        return """{"brand":"$brand","model":"$model","sdk":$sdk,"release":"$release","agentVersion":"$version","agentVersionCode":$versionCode}"""
-    }
-
-    private fun respondText(output: OutputStream, status: Int, body: String, contentType: String = "text/plain; charset=utf-8") {
-        val bodyBytes: ByteArray = body.toByteArray(Charsets.UTF_8)
-        val header: String = buildResponseHeader(status, contentType, bodyBytes.size)
-        output.write(header.toByteArray(Charsets.US_ASCII))
-        output.write(bodyBytes)
-        output.flush()
-    }
-
-    private fun respondBinary(output: OutputStream, status: Int, body: ByteArray, contentType: String) {
-        val header: String = buildResponseHeader(status, contentType, body.size)
-        output.write(header.toByteArray(Charsets.US_ASCII))
-        output.write(body)
-        output.flush()
-    }
-
-    private fun buildResponseHeader(status: Int, contentType: String, contentLength: Int): String {
-        val statusText: String = when (status) {
-            200 -> "OK"
-            404 -> "Not Found"
-            500 -> "Internal Server Error"
-            else -> "Unknown"
-        }
-        return "HTTP/1.1 $status $statusText\r\n" +
-                "Content-Type: $contentType\r\n" +
-                "Content-Length: $contentLength\r\n" +
-                "Connection: close\r\n" +
-                "\r\n"
-    }
-
-    private fun splitPathAndQuery(fullPath: String): Pair<String, String> {
-        val index: Int = fullPath.indexOf('?')
-        return if (index >= 0) {
-            fullPath.substring(0, index) to fullPath.substring(index + 1)
+        val response = if (png != null) {
+            HttpResponse.bytes(HttpStatus.OK, png, "image/png")
         } else {
-            fullPath to ""
+            HttpResponse.text(HttpStatus.INTERNAL_SERVER_ERROR, "screenshot returned null")
+        }
+        HttpProtocol.writeResponse(output, response, keepAlive = keepAlive, headOnly = headOnly)
+    }
+
+    private fun handleHierarchy(params: Map<String, String>): HttpResponse {
+        val compressed: Boolean = params["compressed"]?.toBooleanStrictOrNull() ?: true
+        val xml: String = uiHierarchy.dump(compressed)
+        return HttpResponse.text(HttpStatus.OK, xml, "application/xml; charset=utf-8")
+    }
+
+    private fun handlePackages(params: Map<String, String>): HttpResponse {
+        val userOnly: Boolean = params["user_only"]?.toBooleanStrictOrNull() ?: false
+        val json: String = packageService.listPackages(userOnly)
+        return HttpResponse.text(HttpStatus.OK, json, "application/json; charset=utf-8")
+    }
+
+    private fun handleSignature(params: Map<String, String>): HttpResponse {
+        val packageName: String? = params["pkg"]
+        if (packageName.isNullOrEmpty()) {
+            return HttpResponse.text(HttpStatus.BAD_REQUEST, "missing pkg parameter")
+        }
+        val schemes: String = packageService.getSigningSchemes(packageName)
+        return HttpResponse.text(HttpStatus.OK, schemes, "text/plain; charset=utf-8")
+    }
+
+    private fun handleIcon(params: Map<String, String>): HttpResponse {
+        val packageName: String? = params["pkg"]
+        if (packageName.isNullOrEmpty()) {
+            return HttpResponse.text(HttpStatus.BAD_REQUEST, "missing pkg parameter")
+        }
+        val png: ByteArray? = packageService.getIcon(packageName)
+        return if (png != null) {
+            HttpResponse.bytes(HttpStatus.OK, png, "image/png")
+        } else {
+            HttpResponse.text(HttpStatus.NOT_FOUND, "icon not found")
         }
     }
 
-    private fun parseQueryParams(query: String): Map<String, String> {
-        if (query.isEmpty()) return emptyMap()
-        return query.split("&").mapNotNull { param ->
-            val eqIndex: Int = param.indexOf('=')
-            if (eqIndex > 0) {
-                val key: String = param.substring(0, eqIndex)
-                val value: String = URLDecoder.decode(param.substring(eqIndex + 1), "UTF-8")
-                key to value
-            } else {
-                null
-            }
-        }.toMap()
+    private fun handleInfo(): HttpResponse {
+        val json = JSONObject().apply {
+            put("brand", android.os.Build.BRAND)
+            put("model", android.os.Build.MODEL)
+            put("sdk", android.os.Build.VERSION.SDK_INT)
+            put("release", android.os.Build.VERSION.RELEASE)
+            put("agentVersion", BuildConfig.VERSION_NAME)
+            put("agentVersionCode", BuildConfig.VERSION_CODE)
+        }.toString()
+        return HttpResponse.text(HttpStatus.OK, json, "application/json; charset=utf-8")
     }
 
-    private fun consumeHeaders(input: BufferedReader) {
-        var count: Int = 0
-        while (count < MAX_HEADERS) {
-            val line: String? = input.readLine()
-            if (line.isNullOrEmpty()) return
-            if (line.indexOf(':') <= 0) {
-                throw IllegalArgumentException("malformed header: $line")
-            }
-            count++
-        }
-        throw IllegalArgumentException("too many headers (>$MAX_HEADERS)")
+    private fun handleDeviceInfo(): HttpResponse {
+        val json: String = deviceInfo.buildJson()
+        return HttpResponse.text(HttpStatus.OK, json, "application/json; charset=utf-8")
     }
+
+    private fun writeSafe(output: BufferedOutputStream, response: HttpResponse, keepAlive: Boolean) {
+        try {
+            HttpProtocol.writeResponse(output, response, keepAlive = keepAlive)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun daemonThreadFactory(prefix: String): ThreadFactory {
+        val seq = AtomicInteger(1)
+        return ThreadFactory { runnable ->
+            Thread(runnable, "$prefix-${seq.getAndIncrement()}").apply {
+                isDaemon = true
+            }
+        }
+    }
+
     companion object {
-        private const val MAX_HEADERS: Int = 64
+        private const val CORE_WORKERS: Int = 4
+        private const val MAX_WORKERS: Int = 32
+        private const val WORKER_KEEP_ALIVE_SECONDS: Long = 30L
+        private const val MAX_KEEP_ALIVE_SOCKETS: Int = 16
+        private const val MAX_REQUESTS_PER_CONN: Int = 1000
+        private const val IDLE_TIMEOUT_MS: Int = 15_000
+        private const val ACTIVE_TIMEOUT_MS: Int = 30_000
+        private const val OUTPUT_BUFFER_BYTES: Int = 64 * 1024
     }
 }

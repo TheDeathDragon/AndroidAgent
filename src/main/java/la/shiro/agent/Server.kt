@@ -1,6 +1,3 @@
-@file:Suppress("DEPRECATION")
-@file:SuppressLint("PrivateApi", "DiscouragedPrivateApi")
-
 package la.shiro.agent
 
 import android.annotation.SuppressLint
@@ -9,12 +6,32 @@ import android.app.UiAutomation
 import android.app.UiAutomationConnection
 import android.os.HandlerThread
 import android.os.Looper
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
 
 object Server {
 
     private const val DEFAULT_PORT: Int = 9500
     private const val EXIT_CONNECT_FAILED: Int = 2
+    private const val CONNECT_BUDGET_MS: Long = 30_000L
+    private const val CONNECT_RETRY_INTERVAL_MS: Long = 500L
+    private const val SERVICE_POLL_INTERVAL_MS: Long = 200L
+
+    private class UiAutomationSession(
+        val uiAutomation: UiAutomation,
+        private val handlerThread: HandlerThread
+    ) : AutoCloseable {
+        private val closed = AtomicBoolean(false)
+
+        override fun close() {
+            if (!closed.compareAndSet(false, true)) return
+            safeDisconnect(uiAutomation)
+            try {
+                handlerThread.quitSafely()
+            } catch (_: Throwable) {
+            }
+        }
+    }
 
     @JvmStatic
     fun main(args: Array<String>) {
@@ -22,7 +39,7 @@ object Server {
         println("[Agent] Starting agent server v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
         println("[Agent] Port: $port")
         val context = initializeAndroidRuntime()
-        val uiAutomation: UiAutomation = try {
+        val session: UiAutomationSession = try {
             connectUiAutomation()
         } catch (e: Throwable) {
             println("[Agent] UiAutomation unavailable: ${e.message ?: e.javaClass.simpleName}")
@@ -30,16 +47,21 @@ object Server {
             exitProcess(EXIT_CONNECT_FAILED)
         }
         println("[Agent] UiAutomation connected")
-        val server = SimpleHttpServer(port, uiAutomation, context)
-        server.start()
-        println("[Agent] HTTP server listening on *:$port")
-        Runtime.getRuntime().addShutdownHook(Thread {
+        val server = SimpleHttpServer(port, session.uiAutomation, context)
+        val shutdownDone = AtomicBoolean(false)
+        fun shutdown() {
+            if (!shutdownDone.compareAndSet(false, true)) return
             println("[Agent] Shutting down...")
             try { server.stop() } catch (_: Throwable) {}
-            safeDisconnect(uiAutomation)
-        })
-        while (server.isAlive) {
-            Thread.sleep(1000)
+            session.close()
+        }
+        Runtime.getRuntime().addShutdownHook(Thread(::shutdown, "ShutdownHook"))
+        try {
+            server.start()
+            println("[Agent] HTTP server listening on 127.0.0.1:$port")
+            server.awaitStop()
+        } finally {
+            shutdown()
         }
     }
 
@@ -51,16 +73,12 @@ object Server {
         return context
     }
 
-    private const val CONNECT_BUDGET_MS: Long = 30_000L
-    private const val CONNECT_RETRY_INTERVAL_MS: Long = 500L
-    private const val SERVICE_POLL_INTERVAL_MS: Long = 200L
-
-    private fun connectUiAutomation(): UiAutomation {
+    private fun connectUiAutomation(): UiAutomationSession {
         awaitAccessibilityService(CONNECT_BUDGET_MS)
         val handlerThread = HandlerThread("UiAutomationThread")
         handlerThread.start()
         val deadline: Long = System.currentTimeMillis() + CONNECT_BUDGET_MS
-        var attempt: Int = 0
+        var attempt = 0
         while (true) {
             attempt++
             val connection = UiAutomationConnection()
@@ -70,11 +88,10 @@ object Server {
                 if (attempt > 1) {
                     println("[Agent] UiAutomation connected after $attempt attempts")
                 }
-                return uiAutomation
+                return UiAutomationSession(uiAutomation, handlerThread)
             } catch (e: Throwable) {
-                // First connect() may have already registered with AMS even when
-                // the local wait timed out; without disconnect() every retry hits
-                // "UiAutomationService ... already registered!".
+                // First connect() may have registered with AMS even when the local wait timed out;
+                // without disconnect(), retries fail with "UiAutomationService ... already registered!".
                 safeDisconnect(uiAutomation)
                 if (System.currentTimeMillis() >= deadline) {
                     handlerThread.quitSafely()
@@ -97,7 +114,6 @@ object Server {
         try {
             uiAutomation.disconnect()
         } catch (_: Throwable) {
-            // already detached or never registered — nothing to clean up
         }
     }
 
@@ -115,7 +131,7 @@ object Server {
             return
         }
         val deadline: Long = System.currentTimeMillis() + timeoutMs
-        var waits: Int = 0
+        var waits = 0
         while (System.currentTimeMillis() < deadline) {
             try {
                 val binder = getService.invoke(null, android.content.Context.ACCESSIBILITY_SERVICE)
@@ -126,8 +142,7 @@ object Server {
                     }
                     return
                 }
-            } catch (e: Throwable) {
-                // tolerate transient lookup failures during early boot
+            } catch (_: Throwable) {
             }
             waits++
             Thread.sleep(SERVICE_POLL_INTERVAL_MS)
