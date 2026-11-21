@@ -68,7 +68,7 @@ All endpoints support HTTP/1.1 Keep-Alive (up to 1000 requests per connection, 1
 | GET      | `/icon?pkg=<name>`            | `image/png`                                                       |
 | GET      | `/signature?pkg=<name>`       | text (V1/V2/V3/V4 schemes); 404 when the package is not installed |
 | GET      | `/device-info`                | JSON (14-section profile)                                         |
-| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`release`/`agentVersion`/`agentVersionCode`, plus current-rotation `width`/`height`/`rotation`) |
+| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`release`/`agentVersion`/`agentVersionCode`/`jarSha256`, current-rotation `width`/`height`/`rotation`, `features` e.g. `swipe-easing`) |
 | GET      | `/locales`                    | JSON (`current` + supported `locales`)                            |
 | GET      | `/set-locale?tag=<bcp47>`     | JSON; 400 with `{"ok":false,"error":...}` for a missing or invalid tag |
 | GET      | `/stop`                       | text `stopping` (clean shutdown)                                  |
@@ -85,7 +85,7 @@ All endpoints support HTTP/1.1 Keep-Alive (up to 1000 requests per connection, 1
 ### `/input/*` headers
 
 - Response body is always `{"ok":true}` or `{"ok":false}`
-- `/input/swipe` (and batch `swipe`) takes `easing`: `ease` (default) slows to near zero velocity before `ACTION_UP`, so lists do not fling; `linear` matches `adb shell input swipe` and flings. Prefer it over composing `move` steps in a batch: with `sync=true` every batched `move` waits for the app to consume it, which stretches the gesture.
+- `/input/swipe` (and batch `swipe`) takes `easing`: `ease` (default) slows to near zero velocity before `ACTION_UP`, so lists do not fling; `linear` matches `adb shell input swipe` and flings. Prefer it over composing `move` steps in a batch: batch `wait`s are relative, so each move's injection cost accumulates (a 150 ms gesture measured ~190 ms), while `swipe` schedules moves on absolute uptime.
 - Response header: `X-Input-Source` (`direct` when injected via `InputManager` / `InputManagerGlobal`, or `uiautomation` on fallback or `/input/global`)
 
 ## AXI CLI & Agent Skill

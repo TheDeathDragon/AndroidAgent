@@ -67,7 +67,7 @@ curl http://127.0.0.1:9500/health
 | GET      | `/icon?pkg=<name>`            | `image/png`                                                       |
 | GET      | `/signature?pkg=<name>`       | 文本 (V1/V2/V3/V4 签名方案)；包未安装时返回 404                   |
 | GET      | `/device-info`                | JSON (14 段设备画像)                                              |
-| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`release`/`agentVersion`/`agentVersionCode`，以及当前旋转方向下的 `width`/`height`/`rotation`) |
+| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`release`/`agentVersion`/`agentVersionCode`/`jarSha256`，当前旋转方向下的 `width`/`height`/`rotation`，以及 `features`，如 `swipe-easing`) |
 | GET      | `/locales`                    | JSON（`current` 和支持的 `locales`）                              |
 | GET      | `/set-locale?tag=<bcp47>`     | JSON；缺少或非法 tag 时返回 400 `{"ok":false,"error":...}`        |
 | GET      | `/stop`                       | 文本 `stopping` (优雅关停)                                        |
@@ -84,7 +84,7 @@ curl http://127.0.0.1:9500/health
 ### `/input/*` 响应头
 
 - 响应体固定为 `{"ok":true}` 或 `{"ok":false}`
-- `/input/swipe`（以及 batch 里的 `swipe`）支持 `easing`：`ease`（默认）在 `ACTION_UP` 前减速到接近零，列表不会惯性滚动；`linear` 与 `adb shell input swipe` 一致，会惯性滚动。不要用 batch 拼 `move` 步骤代替：`sync=true` 时每个 `move` 都要等应用处理完，手势会被拉长。
+- `/input/swipe`（以及 batch 里的 `swipe`）支持 `easing`：`ease`（默认）在 `ACTION_UP` 前减速到接近零，列表不会惯性滚动；`linear` 与 `adb shell input swipe` 一致，会惯性滚动。不要用 batch 拼 `move` 步骤代替：batch 的 `wait` 是相对时间，每个 move 的注入开销会累加（实测 150 ms 的手势变成约 190 ms），而 `swipe` 按绝对时间排程。
 - 响应头: `X-Input-Source` (走直连 `InputManager` / `InputManagerGlobal` 时为 `direct`, 回退或 `/input/global` 时为 `uiautomation`)
 
 ## AXI 命令行工具与 Agent Skill

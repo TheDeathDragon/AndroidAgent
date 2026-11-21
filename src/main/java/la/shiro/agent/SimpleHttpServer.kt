@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Point
 import android.hardware.display.DisplayManagerGlobal
 import android.os.Trace
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -402,6 +403,8 @@ class SimpleHttpServer(
             put("agentVersion", BuildConfig.VERSION_NAME)
             put("agentVersionCode", BuildConfig.VERSION_CODE)
             put("jarSha256", jarSha256 ?: JSONObject.NULL)
+            // Explicit capabilities, so hosts need not infer support from unrelated fields.
+            put("features", JSONArray(FEATURES))
             putDisplay(this)
         }.toString()
         return HttpResponse.text(HttpStatus.OK, json, "application/json; charset=utf-8")
@@ -486,6 +489,7 @@ class SimpleHttpServer(
     }
 
     companion object {
+        private val FEATURES: List<String> = listOf("swipe-easing")
         private const val CORE_WORKERS: Int = 4
         private const val MAX_WORKERS: Int = 32
         private const val WORKER_KEEP_ALIVE_SECONDS: Long = 30L
