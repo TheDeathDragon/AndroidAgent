@@ -469,7 +469,31 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                         }
                         if (!copied) return null
                     }
-                    ImageFormat.PNG, ImageFormat.JPEG -> {
+                    ImageFormat.PNG -> {
+                        val rgba = ByteArray(outByteCount)
+                        val encodedVersion = active.frameLock.withLock {
+                            if (active.disposed || !active.hasFrame) {
+                                -1L
+                            } else {
+                                copyRgbaRegion(active.latestRgba, targetW, effectiveCrop, rgba, outByteCount)
+                                active.frameVersion
+                            }
+                        }
+                        if (encodedVersion < 0L) return null
+                        FastPng.encode(rgba, outW, outH, stream)
+                        if (stream.length <= MAX_ENCODED_CACHE_BYTES) {
+                            active.encodedCache = EncodedCache(
+                                frameVersion = encodedVersion,
+                                format = request.format,
+                                quality = request.quality,
+                                crop = effectiveCrop,
+                                width = outW,
+                                height = outH,
+                                data = stream.rawBuffer.copyOf(stream.length)
+                            )
+                        }
+                    }
+                    ImageFormat.JPEG -> {
                         val bitmap: Bitmap
                         val encodedVersion: Long
                         if (effectiveCrop == null) {
@@ -510,12 +534,7 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                             stream.reset()
                         }
 
-                        val compressFormat = if (request.format == ImageFormat.PNG) {
-                            Bitmap.CompressFormat.PNG
-                        } else {
-                            Bitmap.CompressFormat.JPEG
-                        }
-                        bitmap.compress(compressFormat, request.quality, stream)
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, request.quality, stream)
                         if (stream.length <= MAX_ENCODED_CACHE_BYTES) {
                             active.encodedCache = EncodedCache(
                                 frameVersion = encodedVersion,
@@ -770,7 +789,14 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                     argb.copyPixelsToBuffer(ByteBuffer.wrap(dst, 0, byteCount))
                 }
                 ImageFormat.PNG -> {
-                    working.compress(Bitmap.CompressFormat.PNG, request.quality, stream)
+                    val argb: Bitmap = if (working.config == Bitmap.Config.ARGB_8888) {
+                        working
+                    } else {
+                        working.copy(Bitmap.Config.ARGB_8888, false).also { rgbaBitmap = it }
+                    }
+                    val rgba = ByteArray(argb.width * argb.height * 4)
+                    argb.copyPixelsToBuffer(ByteBuffer.wrap(rgba))
+                    FastPng.encode(rgba, argb.width, argb.height, stream)
                 }
                 ImageFormat.JPEG -> {
                     working.compress(Bitmap.CompressFormat.JPEG, request.quality, stream)

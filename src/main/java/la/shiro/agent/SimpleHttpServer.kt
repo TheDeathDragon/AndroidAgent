@@ -51,6 +51,27 @@ class SimpleHttpServer(
     private val deviceInfo: DeviceInfo = DeviceInfo(context)
     private val localeService: LocaleService = LocaleService()
 
+    // Identity of the code this process actually loaded, hashed at startup so a
+    // JAR overwritten afterwards cannot make a stale process claim the new build.
+    // The version code is not usable for this: its yyMM part is the build date.
+    private val jarSha256: String? = try {
+        val path = System.getProperty("java.class.path")?.split(':')?.firstOrNull { it.isNotEmpty() }
+        if (path == null) null else {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            java.io.File(path).inputStream().use { input ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    digest.update(buf, 0, n)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
     val isAlive: Boolean get() = running.get()
 
     fun start() {
@@ -380,6 +401,7 @@ class SimpleHttpServer(
             put("release", android.os.Build.VERSION.RELEASE)
             put("agentVersion", BuildConfig.VERSION_NAME)
             put("agentVersionCode", BuildConfig.VERSION_CODE)
+            put("jarSha256", jarSha256 ?: JSONObject.NULL)
             putDisplay(this)
         }.toString()
         return HttpResponse.text(HttpStatus.OK, json, "application/json; charset=utf-8")

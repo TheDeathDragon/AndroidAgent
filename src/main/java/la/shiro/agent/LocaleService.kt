@@ -40,6 +40,21 @@ class LocaleService {
         if (tag.isBlank() || list.isEmpty || (0 until list.size()).any { list[it].language.isEmpty() }) {
             throw IllegalArgumentException("unparsable locale tag: $tag")
         }
+        // A well-formed tag is not a supported one: "zz-bogus" parsed, was applied
+        // and persisted, and the device fell back to its default resources while
+        // reporting zz-bogus as the system language. Matched by language because
+        // the asset list carries "en" alongside "en-US", and both sides go through
+        // forLanguageTag so legacy codes (he/iw, id/in) normalise the same way.
+        val supported: Set<String> = Resources.getSystem().assets.locales
+            .filter { !it.isNullOrEmpty() }
+            .map { java.util.Locale.forLanguageTag(it).language }
+            .toSet()
+        for (i in 0 until list.size()) {
+            if (list[i].language !in supported) {
+                throw IllegalArgumentException(
+                    "locale not supported by this device: ${list[i].toLanguageTag()} (see /locales)")
+            }
+        }
         val previous: String = currentLocaleTag()
         val am: Any = activityManagerService()
         val config: Configuration = getConfiguration(am)
