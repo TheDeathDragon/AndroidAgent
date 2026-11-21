@@ -55,6 +55,13 @@ class PackageService(private val context: Context) {
         val packages: List<PackageInfo> = packageManager.getInstalledPackages(flags)
         val result = JSONArray()
         for (pkg in packages) {
+            // Per-package guard: this loop reads another app's resources, parses
+            // its APK signing block and touches hidden framework fields, any of
+            // which can throw an Error rather than an Exception on a vendor ROM.
+            // Unguarded, one malformed package aborted the whole response and the
+            // tester saw an empty app list with no explanation. Dropping the one
+            // entry is the only degradation that keeps the other 200 usable.
+            try {
             val appInfo: ApplicationInfo = pkg.applicationInfo ?: continue
             val isSystem: Boolean = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
             if (userOnly && isSystem) continue
@@ -82,6 +89,9 @@ class PackageService(private val context: Context) {
             obj.put("signatureSha256", extractSignatureSha256(pkg))
             obj.put("dataDir", appInfo.dataDir ?: JSONObject.NULL)
             result.put(obj)
+            } catch (_: Throwable) {
+                // Skip this package; the rest of the list still goes out.
+            }
         }
         return result.toString()
     }
@@ -101,9 +111,17 @@ class PackageService(private val context: Context) {
         }
     }
 
-    fun getSigningSchemes(packageName: String): String {
+    // Null means "no such package", empty means "installed, no scheme detected".
+    // Collapsing both into "" made the endpoint answer 200 with an empty body
+    // for a package that does not exist, so the caller could not tell the two
+    // apart and the app reported an uninstalled package as 未签名.
+    fun getSigningSchemes(packageName: String): String? {
+        val appInfo: ApplicationInfo = try {
+            packageManager.getApplicationInfo(packageName, 0)
+        } catch (_: Throwable) {
+            return null
+        }
         return try {
-            val appInfo: ApplicationInfo = packageManager.getApplicationInfo(packageName, 0)
             val apkPath: String = appInfo.sourceDir
             val apkSize: Long = File(apkPath).length()
             val cacheKey = "$apkPath:$apkSize"
@@ -124,7 +142,7 @@ class PackageService(private val context: Context) {
                 }
                 if (hasSf) schemes.add("V1")
             }
-        } catch (_: Exception) { }
+        } catch (_: Throwable) { }
         try {
             RandomAccessFile(file, "r").use { raf ->
                 val eocdOffset: Long = findEocdOffset(raf) ?: return@use
@@ -154,7 +172,7 @@ class PackageService(private val context: Context) {
                     pos += 8 + pairLen
                 }
             }
-        } catch (_: Exception) { }
+        } catch (_: Throwable) { }
         if (File("$apkPath.idsig").exists()) schemes.add("V4")
         return schemes.joinToString("+")
     }
@@ -266,7 +284,7 @@ class PackageService(private val context: Context) {
             } else {
                 appInfo.packageName
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             appInfo.packageName
         }
     }

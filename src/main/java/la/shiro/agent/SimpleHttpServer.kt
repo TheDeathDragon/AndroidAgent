@@ -46,6 +46,7 @@ class SimpleHttpServer(
     private val inputController: InputController = InputController(uiAutomation)
     private val packageService: PackageService = PackageService(context)
     private val deviceInfo: DeviceInfo = DeviceInfo(context)
+    private val localeService: LocaleService = LocaleService()
 
     val isAlive: Boolean get() = running.get()
 
@@ -220,6 +221,8 @@ class SimpleHttpServer(
             "/icon" -> handleIcon(request.query)
             "/info" -> handleInfo()
             "/device-info" -> handleDeviceInfo()
+            "/locales" -> handleLocales()
+            "/set-locale" -> handleSetLocale(request.query)
             "/input/tap" -> handleInputTap(request)
             "/input/swipe" -> handleInputSwipe(request)
             "/input/key" -> handleInputKey(request)
@@ -309,9 +312,34 @@ class SimpleHttpServer(
         if (packageName.isNullOrEmpty()) {
             return HttpResponse.text(HttpStatus.BAD_REQUEST, "missing pkg parameter")
         }
+        // 404 rather than an empty 200: an empty body means "installed, no scheme detected",
+        // and the host must not report an uninstalled app as unsigned.
         val schemes: String = packageService.getSigningSchemes(packageName)
+            ?: return HttpResponse.text(HttpStatus.NOT_FOUND, "package not found: $packageName")
         return HttpResponse.text(HttpStatus.OK, schemes, "text/plain; charset=utf-8")
     }
+
+    private fun handleLocales(): HttpResponse {
+        val json: String = localeService.buildLocalesJson()
+        return HttpResponse.text(HttpStatus.OK, json, "application/json; charset=utf-8")
+    }
+
+    private fun handleSetLocale(params: Map<String, String>): HttpResponse {
+        val tag: String? = params["tag"]
+        if (tag.isNullOrBlank()) {
+            return jsonError(HttpStatus.BAD_REQUEST, "missing tag parameter")
+        }
+        return try {
+            HttpResponse.text(HttpStatus.OK, localeService.setLocale(tag), "application/json; charset=utf-8")
+        } catch (e: Throwable) {
+            System.err.println("[Agent] Set locale failed for $tag: ${e.message}")
+            val status = if (e is IllegalArgumentException) HttpStatus.BAD_REQUEST else HttpStatus.INTERNAL_SERVER_ERROR
+            jsonError(status, e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private fun jsonError(status: HttpStatus, message: String): HttpResponse =
+        HttpResponse.text(status, localeService.errorJson(message), "application/json; charset=utf-8")
 
     private fun handleIcon(params: Map<String, String>): HttpResponse {
         val packageName: String? = params["pkg"]
