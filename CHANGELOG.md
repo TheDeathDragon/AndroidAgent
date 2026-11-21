@@ -5,6 +5,8 @@ are `YYMM.NNNN` (year-month + zero-padded `git rev-list --count HEAD`).
 
 ## [Unreleased]
 
+## [2611.0025] - 2026-11-21
+
 ### Added
 - HTTP/1.1 Keep-Alive transport with clean shutdown.
 - `/input/tap`, `/input/swipe`, `/input/key`, `/input/text`, `/input/global`, `/input/batch` with a direct `InputManager` fast path and `UiAutomation` fallback.
