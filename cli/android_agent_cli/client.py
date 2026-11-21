@@ -35,11 +35,13 @@ class AgentClient:
         port: int = 9500,
         timeout: float = 15.0,
         serial: str | None = None,
+        cli_prefix: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
         self.serial = serial
+        self.cli_prefix = cli_prefix
         self._conn: http.client.HTTPConnection | None = None
 
     def __enter__(self) -> AgentClient:
@@ -57,6 +59,8 @@ class AgentClient:
             self._conn = None
 
     def _cli_prefix(self) -> str:
+        if self.cli_prefix:
+            return self.cli_prefix
         parts = ["android-agent"]
         if self.serial:
             parts.extend(["-s", self.serial])
@@ -191,13 +195,20 @@ class AgentClient:
             params=params,
         )
 
-    @staticmethod
-    def _parse_input_response(res: HttpResult) -> dict[str, Any]:
+    def _parse_input_response(self, res: HttpResult, not_injected_hint: str | None = None) -> dict[str, Any]:
         raw = res.json()
         data = dict(raw) if isinstance(raw, dict) else {"ok": bool(raw)}
         source = res.headers.get("x-input-source", "").strip()
         if source:
             data["source"] = source
+        # Exit 0 means success; an `ok: false` printed under exit 0 reads as success to
+        # scripts and agents that only check the status.
+        if data.get("ok") is False:
+            raise RuntimeAxiError(
+                "the agent could not inject the input",
+                details=data,
+                help_hints=[not_injected_hint or f"Run `{self._cli_prefix()} screen` to check the device state, then retry"],
+            )
         return data
 
     def post_tap(self, x: float, y: float, duration_ms: int = 0, sync: bool = True) -> dict[str, Any]:
@@ -220,6 +231,7 @@ class AgentClient:
         steps: int | None = None,
         hold_ms: int = 0,
         sync: bool = True,
+        easing: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "x1": x1,
@@ -232,6 +244,8 @@ class AgentClient:
         }
         if steps is not None:
             payload["steps"] = steps
+        if easing is not None:
+            payload["easing"] = easing
         return self._parse_input_response(
             self.request("POST", "/input/swipe", json_body=payload, retry_on_reset=False)
         )
@@ -273,7 +287,8 @@ class AgentClient:
                     "sync": sync,
                 },
                 retry_on_reset=False,
-            )
+            ),
+            not_injected_hint="No focused editable field: tap the input first, or pass --text/--id/--query to `type`",
         )
 
     def post_global(self, action: str | int) -> dict[str, Any]:

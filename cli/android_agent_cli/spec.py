@@ -180,8 +180,8 @@ class CommandSpec:
 GLOBAL_FLAGS: tuple[FlagSpec, ...] = (
     FlagSpec("help", "--help", "-h", kind="bool", default=False, description="Show help for this command"),
     FlagSpec("serial", "--serial", "-s", kind="str", default=None, value_name="SERIAL", description="Target ADB device serial"),
-    FlagSpec("port", "--port", "-p", kind="int", default=9500, value_name="PORT", description="Forwarded agent HTTP port (default: 9500)", min_val=1, max_val=65535),
-    FlagSpec("host", "--host", kind="str", default="127.0.0.1", value_name="HOST", description="Agent HTTP host (default: 127.0.0.1)"),
+    FlagSpec("port", "--port", "-p", kind="int", default=9500, value_name="PORT", description="Agent port on the device (default: 9500); the host side is an adb-assigned forward per device", min_val=1, max_val=65535),
+    FlagSpec("host", "--host", kind="str", default=None, value_name="HOST", description="Connect straight to an agent at HOST:PORT, bypassing adb forwarding"),
 )
 
 GLOBAL_RENAMED_FLAGS: dict[str, tuple[str, str]] = {
@@ -232,7 +232,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(
         name="status",
         aliases=("health",),
-        summary="Check agent /health, /info, and connected ADB devices",
+        summary="List connected ADB devices with the agent state and version on each",
         usage="android-agent status",
         examples=(
             "android-agent status",
@@ -252,7 +252,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
             FlagSpec("quality", "--quality", kind="int", default=None, value_name="INT", description="Compression quality 1..100 (default: 80 for jpeg, 100 for png/rgba)", min_val=1, max_val=100),
             FlagSpec("scale", "--scale", kind="float", default=0.5, value_name="FLOAT", description="Downscale factor 0.1..1.0 (default: 0.5)", min_val=0.1, max_val=1.0),
             FlagSpec("crop", "--crop", kind="str", default=None, value_name="X,Y,W,H", description="Crop region in scaled image pixels: x,y,w,h (x>=0, y>=0, w>0, h>0)"),
-            FlagSpec("fast", "--fast", negated="--no-fast", kind="bool", default=True, description="Use VirtualDisplay mirror when available on Android 10+ (default: --fast)"),
+            FlagSpec("fast", "--fast", negated="--no-fast", kind="bool", default=False, description="Use a VirtualDisplay mirror (Android 10+): faster for bursts of captures, but while it lives the device composes an extra display every frame and janks; the agent releases it 5 s after the last fast capture (default: --no-fast)"),
         ),
         renamed_flags={
             "--output": ("--out", "--output is not used; use --out PATH instead"),
@@ -261,7 +261,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
             "android-agent screen",
             "android-agent screen --format png --scale 1.0 --out screen.png",
             "android-agent screen --crop 0,0,540,400 --scale 0.5",
-            "android-agent screen --no-fast --quality 90",
+            "android-agent screen --fast --scale 0.3",
         ),
         min_args=0,
         max_args=0,
@@ -326,7 +326,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(
         name="swipe",
         summary="Swipe between coordinates or in a cardinal direction (up, down, left, right)",
-        usage="android-agent swipe (<x1> <y1> <x2> <y2> | up|down|left|right) [--distance 0.6] [--duration 300] [--steps N] [--hold 0] [--no-sync]",
+        usage="android-agent swipe (<x1> <y1> <x2> <y2> | up|down|left|right) [--distance 0.6] [--duration 300] [--easing linear|ease] [--steps N] [--hold 0] [--no-sync]",
         positionals=(
             PosSpec("coords_or_dir", required=True, description="Four coordinates <x1> <y1> <x2> <y2> or direction up|down|left|right"),
         ),
@@ -335,6 +335,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
             FlagSpec("duration", "--duration", kind="int", default=300, value_name="MS", description="Swipe duration in ms (0..30000, default: 300)", min_val=0, max_val=30000),
             FlagSpec("steps", "--steps", kind="int", default=None, value_name="N", description="Interpolation step count (1..300)", min_val=1, max_val=300),
             FlagSpec("hold", "--hold", kind="int", default=0, value_name="MS", description="Hold at end position before release (0..10000, default: 0)", min_val=0, max_val=10000),
+            FlagSpec("easing", "--easing", kind="str", default="linear", value_name="CURVE", description="linear: constant velocity like `adb shell input swipe`, lists fling (default); ease: slows to a stop, no fling", choices=("linear", "ease")),
             FlagSpec("no_sync", "--no-sync", kind="bool", default=False, description="Inject asynchronously (sync=false, fire-and-forget for lowest latency)"),
         ),
         renamed_flags={
@@ -739,7 +740,10 @@ def render_skill_md() -> str:
         "## Notes",
         "",
         "- `start` and `stop` are idempotent and exit 0 when already in the target state; `start` verifies the on-device JAR by SHA-256 before skipping push.",
-        "- `screen` defaults to `--fast --format jpeg --quality 80 --scale 0.5` (Android 10+ VirtualDisplay mirror, with `frameVersion` encoding cache reported as `cache_hit: true` when the frame is unchanged); `--crop X,Y,W,H` uses scaled image pixels, while `tap` and `swipe` always use native screen pixels.",
+        "- Each device is reached through its own adb-assigned forward to the agent's device port (found again on every run, created once with `adb forward tcp:0`), never a fixed host port: `adb forward` is global, so a fixed port is silently taken over by another tool and commands land on another phone. With several devices pass `-s SERIAL`; `status` lists the agent state per device. `--host` connects straight to `HOST:PORT` without adb.",
+        "- `screen` defaults to `--format jpeg --quality 80 --scale 0.5` via UiAutomation. `--fast` uses a VirtualDisplay mirror with a `frameVersion` encoding cache (`cache_hit: true` when the frame is unchanged); it pays off only for bursts, because the device composes the mirror every frame (measured: visible jank 10x while scrolling) until the agent releases it 5 s after the last fast capture. `--crop X,Y,W,H` uses scaled image pixels, while `tap` and `swipe` always use native screen pixels.",
+        "- `swipe` defaults to `--easing linear` (constant velocity, like `adb shell input swipe`, so lists fling); `--easing ease` slows to a stop. Directional swipes size themselves from `/info` in the current rotation.",
+        "- `launch` resolves the launcher activity on the device and starts it with the launcher's flags, so a running app resumes as from the home screen.",
         "- `tap`, `swipe`, `key`, `type`, and `batch` use direct `InputManager` injection (`source: direct`) with automatic `UiAutomation` fallback (`source: uiautomation`); `type` uses `ACTION_SET_TEXT` on focused editable nodes when `--clear` or Unicode text is given.",
         "- `tap` and `type` accept `--text/--id/--query` to find and tap a UI element over one Keep-Alive connection, walking up to clickable ancestors and returning an inline candidate table on ambiguous matches.",
         "- `wait` polls `/hierarchy` over a single Keep-Alive connection until a selector appears (or disappears with `--gone`), avoiding multi-turn shell polling loops.",

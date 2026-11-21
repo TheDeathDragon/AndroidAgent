@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.SystemClock
 import android.view.Surface
 import java.io.ByteArrayOutputStream
 import java.lang.reflect.InvocationTargetException
@@ -393,6 +394,18 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
     private var mirrorThread: HandlerThread? = null
     private var mirrorHandler: Handler? = null
 
+    // A live mirror makes SurfaceFlinger compose a second display on the GPU every frame.
+    // Measured on a Unisoc T606 while scrolling Settings: SF CPU 7.3 -> 15.6 s per 14 s,
+    // composite 2.9 -> 7.3 ms, visible janky frames 5 -> 52. The agent is shared by every
+    // host on the device, so the mirror is released once fast captures stop, instead of
+    // degrading the device under test until the agent exits.
+    @Volatile
+    private var lastFastCaptureMs: Long = 0L
+    private val idleReaper = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "ScreenCaptureIdle").apply { isDaemon = true }
+    }
+    private var idleCheckScheduled = false
+
     fun capture(request: CaptureRequest = CaptureRequest()): CaptureResult? {
         if (request.fast) {
             val fastResult = captureFast(request)
@@ -408,6 +421,8 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
         try {
             synchronized(captureLock) {
                 val active = ensureActiveLocked(desiredConfig) ?: return null
+                lastFastCaptureMs = SystemClock.uptimeMillis()
+                scheduleIdleCheckLocked(MIRROR_IDLE_RELEASE_MS)
                 if (!awaitFirstFrame(active)) {
                     return null
                 }
@@ -851,6 +866,32 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
         return SurfaceConfig(size.x, size.y, display.rotation, layerStack, targetW, targetH)
     }
 
+    // Runs on its own thread, never the mirror handler: captureFast holds captureLock while it
+    // waits for the handler to deliver the first frame.
+    private fun scheduleIdleCheckLocked(delayMs: Long) {
+        if (idleCheckScheduled) return
+        idleCheckScheduled = true
+        try {
+            idleReaper.schedule({ releaseIfIdle() }, delayMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: Throwable) {
+            idleCheckScheduled = false
+        }
+    }
+
+    private fun releaseIfIdle() {
+        synchronized(captureLock) {
+            idleCheckScheduled = false
+            val current = state as? VirtualDisplayState.Active ?: return
+            val idleFor = SystemClock.uptimeMillis() - lastFastCaptureMs
+            if (idleFor < MIRROR_IDLE_RELEASE_MS) {
+                scheduleIdleCheckLocked(MIRROR_IDLE_RELEASE_MS - idleFor)
+                return
+            }
+            disposeActiveLocked(current)
+            state = VirtualDisplayState.Uninitialized
+        }
+    }
+
     private fun ensureMirrorHandlerLocked(): Handler {
         val existing = mirrorHandler
         if (existing != null) return existing
@@ -866,9 +907,18 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
             active.disposed = true
             active.frameReady.signalAll()
         }
-        try { active.imageReader.setOnImageAvailableListener(null, null) } catch (_: Throwable) {}
-        try { active.mirrorDisplay.close() } catch (_: Throwable) {}
-        try { active.imageReader.close() } catch (_: Throwable) {}
+        // Native teardown runs on the mirror handler, serialized with onMirrorImageAvailable:
+        // closing the ImageReader from another thread while the handler still reads an
+        // image's plane buffer is a use-after-free that would crash the shared agent.
+        val closeNative = {
+            try { active.imageReader.setOnImageAvailableListener(null, null) } catch (_: Throwable) {}
+            try { active.mirrorDisplay.close() } catch (_: Throwable) {}
+            try { active.imageReader.close() } catch (_: Throwable) {}
+        }
+        val handler = mirrorHandler
+        if (handler == null || !handler.post(closeNative)) {
+            closeNative()
+        }
         try { active.encodeBitmap?.recycle() } catch (_: Throwable) {}
         active.encodeBitmap = null
         try { active.cropBitmap?.recycle() } catch (_: Throwable) {}
@@ -883,6 +933,7 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
                 disposeActiveLocked(current)
             }
             state = VirtualDisplayState.Closed
+            try { idleReaper.shutdownNow() } catch (_: Throwable) {}
             try { mirrorThread?.quitSafely() } catch (_: Throwable) {}
             mirrorThread = null
             mirrorHandler = null
@@ -896,5 +947,6 @@ class ScreenCapture(private val uiAutomation: UiAutomation) : AutoCloseable {
         private const val IMAGE_READER_MAX_IMAGES: Int = 3
         private const val FIRST_FRAME_TIMEOUT_MS: Long = 300L
         private const val MAX_ENCODED_CACHE_BYTES: Int = 4 * 1024 * 1024
+        private const val MIRROR_IDLE_RELEASE_MS: Long = 5_000L
     }
 }

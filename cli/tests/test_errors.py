@@ -35,13 +35,13 @@ class TestErrors(unittest.TestCase):
     def test_connection_error_carries_forward_global_flags(self) -> None:
         out = io.StringIO()
         err = io.StringIO()
-        # Use a closed ephemeral port on localhost.
-        code = main(["-s", "DEV99", "-p", "1", "signature", "com.example.app"], stdout=out, stderr=err)
+        # Use a closed ephemeral port on localhost, reached directly (no adb forwarding).
+        code = main(["-s", "DEV99", "--host", "127.0.0.1", "-p", "1", "signature", "com.example.app"], stdout=out, stderr=err)
         self.assertEqual(code, 1)
         self.assertEqual(err.getvalue(), "")
         text = out.getvalue()
         self.assertIn("error:", text)
-        self.assertIn("android-agent -s DEV99 -p 1 start", text)
+        self.assertIn("android-agent -s DEV99 -p 1 --host 127.0.0.1 start", text)
 
     def test_debug_env_emits_traceback_to_stderr_only_when_enabled(self) -> None:
         out = io.StringIO()

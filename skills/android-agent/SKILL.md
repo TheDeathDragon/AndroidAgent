@@ -25,8 +25,8 @@ python cli/android_agent.py status
 |------|-------------|
 | `-h/--help` | Show help for this command |
 | `-s/--serial SERIAL` | Target ADB device serial |
-| `-p/--port PORT` | Forwarded agent HTTP port (default: 9500) |
-| `--host HOST` | Agent HTTP host (default: 127.0.0.1) |
+| `-p/--port PORT` | Agent port on the device (default: 9500); the host side is an adb-assigned forward per device |
+| `--host HOST` | Connect straight to an agent at HOST:PORT, bypassing adb forwarding |
 
 ## Commands
 
@@ -69,7 +69,7 @@ android-agent -s R58N12345 -p 9501 stop
 
 ### `status` (aliases: `health`)
 
-Check agent /health, /info, and connected ADB devices.
+List connected ADB devices with the agent state and version on each.
 
 Usage: `android-agent status`
 
@@ -89,13 +89,13 @@ Usage: `android-agent screen [--out PATH] [--format jpeg|png|rgba] [--quality 1.
 - `--quality INT`: Compression quality 1..100 (default: 80 for jpeg, 100 for png/rgba)
 - `--scale FLOAT`: Downscale factor 0.1..1.0 (default: 0.5)
 - `--crop X,Y,W,H`: Crop region in scaled image pixels: x,y,w,h (x>=0, y>=0, w>0, h>0)
-- `--fast/--no-fast`: Use VirtualDisplay mirror when available on Android 10+ (default: --fast)
+- `--fast/--no-fast`: Use a VirtualDisplay mirror (Android 10+): faster for bursts of captures, but while it lives the device composes an extra display every frame and janks; the agent releases it 5 s after the last fast capture (default: --no-fast)
 
 ```sh
 android-agent screen
 android-agent screen --format png --scale 1.0 --out screen.png
 android-agent screen --crop 0,0,540,400 --scale 0.5
-android-agent screen --no-fast --quality 90
+android-agent screen --fast --scale 0.3
 ```
 
 ### `ui` (aliases: `hierarchy`)
@@ -148,12 +148,13 @@ android-agent tap --id search_bar --duration 600
 
 Swipe between coordinates or in a cardinal direction (up, down, left, right).
 
-Usage: `android-agent swipe (<x1> <y1> <x2> <y2> | up|down|left|right) [--distance 0.6] [--duration 300] [--steps N] [--hold 0] [--no-sync]`
+Usage: `android-agent swipe (<x1> <y1> <x2> <y2> | up|down|left|right) [--distance 0.6] [--duration 300] [--easing linear|ease] [--steps N] [--hold 0] [--no-sync]`
 
 - `--distance FRAC`: Screen fraction for directional swipe (0.05..0.95, default: 0.6)
 - `--duration MS`: Swipe duration in ms (0..30000, default: 300)
 - `--steps N`: Interpolation step count (1..300)
 - `--hold MS`: Hold at end position before release (0..10000, default: 0)
+- `--easing CURVE`: linear: constant velocity like `adb shell input swipe`, lists fling (default); ease: slows to a stop, no fling
 - `--no-sync`: Inject asynchronously (sync=false, fire-and-forget for lowest latency)
 
 ```sh
@@ -366,7 +367,10 @@ android-agent skill --check
 ## Notes
 
 - `start` and `stop` are idempotent and exit 0 when already in the target state; `start` verifies the on-device JAR by SHA-256 before skipping push.
-- `screen` defaults to `--fast --format jpeg --quality 80 --scale 0.5` (Android 10+ VirtualDisplay mirror, with `frameVersion` encoding cache reported as `cache_hit: true` when the frame is unchanged); `--crop X,Y,W,H` uses scaled image pixels, while `tap` and `swipe` always use native screen pixels.
+- Each device is reached through its own adb-assigned forward to the agent's device port (found again on every run, created once with `adb forward tcp:0`), never a fixed host port: `adb forward` is global, so a fixed port is silently taken over by another tool and commands land on another phone. With several devices pass `-s SERIAL`; `status` lists the agent state per device. `--host` connects straight to `HOST:PORT` without adb.
+- `screen` defaults to `--format jpeg --quality 80 --scale 0.5` via UiAutomation. `--fast` uses a VirtualDisplay mirror with a `frameVersion` encoding cache (`cache_hit: true` when the frame is unchanged); it pays off only for bursts, because the device composes the mirror every frame (measured: visible jank 10x while scrolling) until the agent releases it 5 s after the last fast capture. `--crop X,Y,W,H` uses scaled image pixels, while `tap` and `swipe` always use native screen pixels.
+- `swipe` defaults to `--easing linear` (constant velocity, like `adb shell input swipe`, so lists fling); `--easing ease` slows to a stop. Directional swipes size themselves from `/info` in the current rotation.
+- `launch` resolves the launcher activity on the device and starts it with the launcher's flags, so a running app resumes as from the home screen.
 - `tap`, `swipe`, `key`, `type`, and `batch` use direct `InputManager` injection (`source: direct`) with automatic `UiAutomation` fallback (`source: uiautomation`); `type` uses `ACTION_SET_TEXT` on focused editable nodes when `--clear` or Unicode text is given.
 - `tap` and `type` accept `--text/--id/--query` to find and tap a UI element over one Keep-Alive connection, walking up to clickable ancestors and returning an inline candidate table on ambiguous matches.
 - `wait` polls `/hierarchy` over a single Keep-Alive connection until a selector appears (or disappears with `--gone`), avoiding multi-turn shell polling loops.

@@ -32,7 +32,7 @@ from .spec import (
 from .toon import truncate_text
 from .ui_parser import UiNode, filter_ui_nodes, node_matches, parse_hierarchy_xml, resolve_tap_targets
 
-_KEYCODE_NAME_RE = re.compile(r"^KEYCODE_[A-Z0-9_]+$")
+_KEYCODE_NAME_RE = re.compile(r"KEYCODE_[A-Z0-9_]+")
 _XML_TRUNCATE_LIMIT = 2000
 
 
@@ -40,14 +40,39 @@ def _cli_prefix(globals_dict: dict[str, Any]) -> str:
     parts = [TOOL_NAME]
     serial = globals_dict.get("serial")
     port = globals_dict.get("port", 9500)
-    host = globals_dict.get("host", "127.0.0.1")
+    host = globals_dict.get("host")
     if serial:
         parts.extend(["-s", str(serial)])
     if port != 9500:
         parts.extend(["-p", str(port)])
-    if host != "127.0.0.1":
+    if host:
         parts.extend(["--host", str(host)])
     return " ".join(parts)
+
+
+def _endpoint(globals_dict: dict[str, Any], create: bool = True) -> tuple[str, int | None, str | None]:
+    """(host, host_port, serial) to reach the agent; host_port is None when no forward exists and create=False."""
+    host = globals_dict.get("host")
+    if host:
+        return host, globals_dict["port"], globals_dict.get("serial")
+    cached = globals_dict.get("_endpoint")
+    if cached is not None and (cached[1] is not None or not create):
+        return cached
+    serial = adb.resolve_serial(globals_dict.get("serial"))
+    device_port: int = globals_dict["port"]
+    local = adb.ensure_forward(serial, device_port) if create else adb.find_forward(serial, device_port)
+    resolved = ("127.0.0.1", local, serial)
+    globals_dict["_endpoint"] = resolved
+    return resolved
+
+
+def _endpoint_label(globals_dict: dict[str, Any]) -> str:
+    host, local, serial = _endpoint(globals_dict, create=False)
+    if globals_dict.get("host"):
+        return f"http://{host}:{local}"
+    device_port = globals_dict["port"]
+    via = f"127.0.0.1:{local} -> " if local is not None else ""
+    return f"{via}{serial} tcp:{device_port}"
 
 
 def _collapse_home(path_str: str) -> str:
@@ -60,12 +85,51 @@ def _collapse_home(path_str: str) -> str:
         return Path(path_str).as_posix()
 
 
+def _gesture_timeout(gesture_ms: int) -> float:
+    # The request must outlive the gesture: timing out while the agent still holds the
+    # pointer reports failure for a gesture that lands, inviting a duplicate retry.
+    return max(15.0, gesture_ms / 1000.0 + 10.0)
+
+
+def _batch_duration_ms(actions: list[dict[str, Any]]) -> int:
+    # Mirrors the agent's defaults (InputController: swipe 300 ms, key interval applied
+    # between codes) so the request outlives the batch.
+    def num(action: dict[str, Any], keys: tuple[str, ...], default: int) -> int:
+        for key in keys:
+            value = action.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str):
+                try:
+                    return int(float(value))
+                except ValueError:
+                    continue
+        return default
+
+    total = 0
+    for action in actions:
+        kind = str(action.get("type", "")).lower()
+        if kind == "swipe":
+            total += num(action, ("durationMs", "duration"), 300) + num(action, ("holdMs", "hold"), 0)
+        elif kind in ("tap", "wait"):
+            total += num(action, ("durationMs", "duration", "ms"), 0)
+        elif kind == "key":
+            codes = action.get("keyCodes") or action.get("keycodes") or action.get("codes") or [None]
+            count = len(codes) if isinstance(codes, list) else 1
+            total += num(action, ("intervalMs", "interval"), 0) * max(0, count - 1)
+    return total
+
+
 def _make_client(globals_dict: dict[str, Any], timeout: float = 15.0) -> AgentClient:
+    host, port, serial = _endpoint(globals_dict)
     return AgentClient(
-        host=globals_dict["host"],
-        port=globals_dict["port"],
+        host=host,
+        port=port if port is not None else globals_dict["port"],
         timeout=timeout,
-        serial=globals_dict["serial"],
+        serial=serial,
+        cli_prefix=_cli_prefix(globals_dict),
     )
 
 
@@ -106,33 +170,25 @@ def handle_home(inv: ParsedInvocation) -> dict[str, Any]:
     except RuntimeAxiError as exc:
         adb_error = exc.message
 
-    agent_status = f"stopped ({inv.globals['host']}:{inv.globals['port']})"
-    agent_running = False
-    with _make_client(inv.globals, timeout=0.3) as client:
-        if client.probe_health(timeout=0.3):
-            agent_running = True
-            try:
-                info = client.get_info()
-                model = info.get("model", "")
-                brand = info.get("brand", "")
-                release = info.get("release", "")
-                sdk = info.get("sdk", "")
-                ver = info.get("agentVersion", "")
-                desc = f"{brand} {model}".strip()
-                agent_status = f"running ({inv.globals['host']}:{inv.globals['port']}, {desc}, Android {release} SDK {sdk}, v{ver})"
-            except RuntimeAxiError:
-                agent_status = f"running ({inv.globals['host']}:{inv.globals['port']})"
+    # Per device, from existing forwards only: a session-start hook must neither create
+    # forwards nor report whichever phone a shared 127.0.0.1:9500 happened to reach.
+    shown = devices[: (4 if is_hook else 16)]
+    rows = [_device_agent_row(d, inv.globals["port"]) for d in shown]
+    agent_running = any(r.get("agent") == "running" for r in rows)
 
     payload: dict[str, Any] = {
         "bin": bin_path,
         "description": TOOL_DESCRIPTION,
-        "agent": agent_status,
     }
+    if inv.globals.get("host"):
+        with _make_client(inv.globals, timeout=0.3) as client:
+            agent_running = client.probe_health(timeout=0.3)
+        payload["agent"] = f"{'running' if agent_running else 'stopped'} ({_endpoint_label(inv.globals)})"
 
     if adb_error:
         payload["adb"] = adb_error
     elif devices:
-        payload["devices"] = [d.to_row() for d in devices[: (4 if is_hook else 16)]]
+        payload["devices"] = rows
     else:
         payload["devices"] = "0 ADB devices connected"
 
@@ -142,8 +198,11 @@ def handle_home(inv: ParsedInvocation) -> dict[str, Any]:
         hints.append(f"Run `{prefix} tap --text \"<label>\"` or `{prefix} swipe up` to interact")
         if not is_hook:
             hints.append(f"Run `{prefix} device` or `{prefix} packages --user-only` for device and app data")
-    elif devices:
+    elif any(d.state == "device" for d in devices):
         hints.append(f"Run `{prefix} start` to launch AndroidAgent on the connected device")
+    elif devices:
+        states = ", ".join(sorted({d.state for d in devices}))
+        hints.append(f"No device is ready ({states}); run `{prefix} devices`, then authorize or reconnect it")
         if not is_hook:
             hints.append(f"Run `{prefix} devices` to inspect connected devices")
     else:
@@ -170,19 +229,19 @@ def handle_devices(inv: ParsedInvocation) -> dict[str, Any]:
 
 def handle_start(inv: ParsedInvocation) -> dict[str, Any]:
     prefix = _cli_prefix(inv.globals)
-    port: int = inv.globals["port"]
-    host: str = inv.globals["host"]
     timeout: float = inv.flags["timeout"]
     restart: bool = inv.flags["restart"]
     jar_override: str | None = inv.flags["jar"]
 
+    # Probe the target device's own forward: the old global 127.0.0.1:9500 could belong to
+    # another phone, which made `-s B start` report "already running" for device A.
     with _make_client(inv.globals, timeout=1.0) as client:
         already_up = client.probe_health(timeout=0.5)
         if already_up and not restart:
             info = client.get_info()
             return {
                 "status": "already running (no-op)",
-                "endpoint": f"http://{host}:{port}",
+                "endpoint": _endpoint_label(inv.globals),
                 "device": f"{info.get('brand', '')} {info.get('model', '')}".strip(),
                 "android": f"{info.get('release', '')} (SDK {info.get('sdk', '')})",
                 "agentVersion": info.get("agentVersion", ""),
@@ -194,11 +253,16 @@ def handle_start(inv: ParsedInvocation) -> dict[str, Any]:
                 pass
             time.sleep(0.3)
 
-    serial = adb.resolve_serial(inv.globals["serial"])
+    if inv.globals.get("host"):
+        raise RuntimeAxiError(
+            f"no agent answers at {_endpoint_label(inv.globals)}",
+            help_hints=["`start` deploys over adb; drop --host to let it push and forward the agent"],
+        )
+    _, _, serial = _endpoint(inv.globals)
+    assert serial is not None
     jar_path = adb.discover_jar(jar_override)
     pushed = adb.push_jar(serial, jar_path)
-    adb.forward_port(serial, port, port)
-    adb.launch_server_detached(serial, port=port)
+    adb.launch_server_detached(serial, port=inv.globals["port"])
 
     deadline = time.monotonic() + timeout
     with _make_client(inv.globals, timeout=1.0) as client:
@@ -208,7 +272,7 @@ def handle_start(inv: ParsedInvocation) -> dict[str, Any]:
                 return {
                     "status": "restarted" if restart else "started",
                     "serial": serial,
-                    "endpoint": f"http://{host}:{port}",
+                    "endpoint": _endpoint_label(inv.globals),
                     "jar": str(jar_path),
                     "jar_pushed": pushed,
                     "device": f"{info.get('brand', '')} {info.get('model', '')}".strip(),
@@ -226,10 +290,6 @@ def handle_start(inv: ParsedInvocation) -> dict[str, Any]:
 
 
 def handle_stop(inv: ParsedInvocation) -> dict[str, Any]:
-    port: int = inv.globals["port"]
-    host: str = inv.globals["host"]
-    serial: str | None = inv.globals["serial"]
-
     stopped = False
     with _make_client(inv.globals, timeout=1.5) as client:
         if client.probe_health(timeout=0.4):
@@ -238,57 +298,74 @@ def handle_stop(inv: ParsedInvocation) -> dict[str, Any]:
             except RuntimeAxiError:
                 pass
             stopped = True
+    label = _endpoint_label(inv.globals)
 
-    try:
-        adb.remove_forward(serial, port)
-    except RuntimeAxiError:
-        pass
+    if not inv.globals.get("host"):
+        _, local, serial = _endpoint(inv.globals, create=False)
+        if local is not None:
+            try:
+                adb.remove_forward(serial, local)
+            except RuntimeAxiError:
+                pass
 
-    if not stopped:
-        return {
-            "status": "already stopped (no-op)",
-            "endpoint": f"http://{host}:{port}",
-        }
     return {
-        "status": "stopped",
-        "endpoint": f"http://{host}:{port}",
+        "status": "stopped" if stopped else "already stopped (no-op)",
+        "endpoint": label,
     }
+
+
+def _device_agent_row(device: adb.AdbDevice, device_port: int) -> dict[str, Any]:
+    # One flaky device must not hide the others' rows or fail the session hook.
+    row = device.to_row()
+    if device.state != "device":
+        return row
+    try:
+        running = adb.agent_process_running(device.serial)
+        row["agent"] = "running" if running else "stopped"
+        if running:
+            local = adb.find_forward(device.serial, device_port)
+            if local is not None:
+                with AgentClient(host="127.0.0.1", port=local, timeout=1.0, serial=device.serial) as client:
+                    if client.probe_health(timeout=0.5):
+                        row["agentVersion"] = client.get_info().get("agentVersion", "")
+    except RuntimeAxiError as exc:
+        row["agent"] = f"unknown ({exc.message})"
+    return row
 
 
 def handle_status(inv: ParsedInvocation) -> dict[str, Any]:
     prefix = _cli_prefix(inv.globals)
-    host: str = inv.globals["host"]
-    port: int = inv.globals["port"]
 
-    devices: list[adb.AdbDevice] = []
-    adb_err: str | None = None
+    if inv.globals.get("host"):
+        payload: dict[str, Any] = {"endpoint": _endpoint_label(inv.globals)}
+        with _make_client(inv.globals, timeout=1.5) as client:
+            if client.probe_health(timeout=0.5):
+                info = client.get_info()
+                payload.update(
+                    status="running",
+                    brand=info.get("brand", ""),
+                    model=info.get("model", ""),
+                    sdk=info.get("sdk", 0),
+                    release=info.get("release", ""),
+                    agentVersion=info.get("agentVersion", ""),
+                )
+            else:
+                payload["status"] = "stopped"
+        return payload
+
+    # Per device: one shared 127.0.0.1:9500 used to report whichever phone it pointed at.
+    # Looks only at existing forwards, so a session-start hook never creates any.
     try:
         devices = adb.list_devices(timeout=2.0)
     except RuntimeAxiError as exc:
-        adb_err = exc.message
-
-    payload: dict[str, Any] = {
-        "endpoint": f"http://{host}:{port}",
-    }
-    with _make_client(inv.globals, timeout=1.5) as client:
-        if client.probe_health(timeout=0.5):
-            info = client.get_info()
-            payload["status"] = "running"
-            payload["brand"] = info.get("brand", "")
-            payload["model"] = info.get("model", "")
-            payload["sdk"] = info.get("sdk", 0)
-            payload["release"] = info.get("release", "")
-            payload["agentVersion"] = info.get("agentVersion", "")
-        else:
-            payload["status"] = "stopped"
-            payload["help"] = f"Run `{prefix} start` to launch AndroidAgent"
-
-    if adb_err:
-        payload["adb"] = adb_err
-    elif devices:
-        payload["devices"] = [d.to_row() for d in devices]
-    else:
-        payload["devices"] = "0 ADB devices connected"
+        return {"adb": exc.message}
+    if not devices:
+        return {"devices": "0 ADB devices connected"}
+    serial_filter = inv.globals.get("serial")
+    rows = [_device_agent_row(d, inv.globals["port"]) for d in devices if not serial_filter or d.serial == serial_filter]
+    payload = {"devices": rows}
+    if any(r.get("agent") == "stopped" for r in rows):
+        payload["help"] = f"Run `{prefix} start` (add -s SERIAL when several devices are connected) to launch AndroidAgent"
     return payload
 
 
@@ -504,7 +581,7 @@ def handle_tap(inv: ParsedInvocation) -> dict[str, Any]:
             )
         x = _parse_finite_float(pos[0], "x")
         y = _parse_finite_float(pos[1], "y")
-        with _make_client(inv.globals) as client:
+        with _make_client(inv.globals, timeout=_gesture_timeout(duration)) as client:
             resp = client.post_tap(x, y, duration_ms=duration, sync=sync)
         payload_xy: dict[str, Any] = {
             "ok": bool(resp.get("ok", False)),
@@ -516,7 +593,7 @@ def handle_tap(inv: ParsedInvocation) -> dict[str, Any]:
             payload_xy["source"] = resp["source"]
         return payload_xy
 
-    with _make_client(inv.globals) as client:
+    with _make_client(inv.globals, timeout=_gesture_timeout(duration)) as client:
         xml_text = client.get_hierarchy(compressed=True)
         snapshot = parse_hierarchy_xml(xml_text)
         targets = resolve_tap_targets(
@@ -592,6 +669,7 @@ def handle_swipe(inv: ParsedInvocation) -> dict[str, Any]:
     duration: int = inv.flags["duration"]
     steps: int | None = inv.flags["steps"]
     hold: int = inv.flags["hold"]
+    easing: str = inv.flags["easing"]
     sync: bool = not inv.flags["no_sync"]
 
     direction: str | None = None
@@ -620,16 +698,26 @@ def handle_swipe(inv: ParsedInvocation) -> dict[str, Any]:
             help_hints=[f"Use `{prefix} swipe up` or `{prefix} swipe 500 1800 500 400`"],
         )
 
-    with _make_client(inv.globals) as client:
+    with _make_client(inv.globals, timeout=_gesture_timeout(duration + hold)) as client:
         if direction is not None:
+            # /info carries the current-rotation size for ~1 ms on the device; a hierarchy
+            # dump walks the whole tree and slows further while a list is still flinging.
             size: tuple[int, int] | None = None
             try:
-                xml_text = client.get_hierarchy(compressed=True)
-                size = parse_hierarchy_xml(xml_text).screen_size()
-            except RuntimeAxiError:
+                info = client.get_info()
+                if int(info.get("width") or 0) > 0 and int(info.get("height") or 0) > 0:
+                    size = (int(info["width"]), int(info["height"]))
+            except (RuntimeAxiError, TypeError, ValueError):
                 size = None
             if size is None:
-                shot = client.get_screenshot(fmt="jpeg", quality=50, scale=1.0, fast=True)
+                try:
+                    xml_text = client.get_hierarchy(compressed=True)
+                    size = parse_hierarchy_xml(xml_text).screen_size()
+                except RuntimeAxiError:
+                    size = None
+            if size is None:
+                # fast=False: the VirtualDisplay mirror would otherwise stay up on the shared agent.
+                shot = client.get_screenshot(fmt="jpeg", quality=50, scale=1.0, fast=False)
                 w = int(shot.headers.get("x-width", "0") or 0)
                 h = int(shot.headers.get("x-height", "0") or 0)
                 if w > 0 and h > 0:
@@ -664,6 +752,7 @@ def handle_swipe(inv: ParsedInvocation) -> dict[str, Any]:
             steps=steps,
             hold_ms=hold,
             sync=sync,
+            easing=easing,
         )
 
     result: dict[str, Any] = {
@@ -712,7 +801,7 @@ def parse_key_codes_arg(raw: str) -> list[int | str]:
             resolved.append(num)
             continue
         upper = token.upper()
-        if _KEYCODE_NAME_RE.match(upper):
+        if _KEYCODE_NAME_RE.fullmatch(upper):
             resolved.append(upper)
             continue
         sample = ", ".join(sorted(KEY_ALIASES.keys())[:12])
@@ -901,10 +990,20 @@ def handle_wait(inv: ParsedInvocation) -> dict[str, Any]:
             time.sleep(sleep_s)
 
 
+# Used with fullmatch: re.match with `$` also accepts a trailing newline, which a shell
+# reads as the end of one command and the start of the next. Single-segment names are legal.
+_PACKAGE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)*")
+_COMPONENT_RE = re.compile(r"[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+")
+_LAUNCHER_INTENT = "-a android.intent.action.MAIN -c android.intent.category.LAUNCHER"
+
+
 def handle_launch(inv: ParsedInvocation) -> dict[str, Any]:
     prefix = _cli_prefix(inv.globals)
     pkg_name = inv.positionals[0].strip()
-    if not pkg_name or any(ch.isspace() for ch in pkg_name):
+    # Package and component go into `am` shell commands. The package grammar has no shell
+    # metacharacters; a component may contain `$` (inner-class activities such as
+    # .Settings$WifiSettingsActivity), so it is also single-quoted (the regex rules out `'`).
+    if not _PACKAGE_RE.fullmatch(pkg_name):
         raise UsageError(f"invalid package name: {inv.positionals[0]}")
     activity_override: str | None = inv.flags["activity"]
     stop_first: bool = inv.flags["stop"]
@@ -913,68 +1012,47 @@ def handle_launch(inv: ParsedInvocation) -> dict[str, Any]:
     component: str | None = None
     if activity_override:
         act = activity_override.strip()
-        if "/" in act:
-            component = act
-        elif act.startswith("."):
-            component = f"{pkg_name}/{act}"
-        else:
-            component = f"{pkg_name}/{act}"
-    else:
-        try:
-            with _make_client(inv.globals, timeout=10.0) as client:
-                pkgs = client.get_packages(user_only=False)
-            found = next((p for p in pkgs if p.get("packageName") == pkg_name), None)
-            if found is None:
-                raise RuntimeAxiError(
-                    f"package not found: {pkg_name}",
-                    help_hints=[f"Run `{prefix} packages --query {pkg_name}` to search installed packages"],
-                )
-            main_act = found.get("mainActivity")
-            if isinstance(main_act, str) and main_act.strip():
-                component = main_act.strip()
-        except RuntimeAxiError as exc:
-            if "package not found:" in exc.message:
-                raise
+        component = act if "/" in act else f"{pkg_name}/{act}"
+        if not _COMPONENT_RE.fullmatch(component):
+            raise UsageError(f"invalid activity: {activity_override}")
 
     serial = adb.resolve_serial(inv.globals["serial"])
     if stop_first:
         adb.run_adb(["shell", f"am force-stop {pkg_name}"], serial=serial, timeout=10.0)
 
+    wait_flag = "-W " if wait_launch else ""
     if component:
-        wait_flag = "-W " if wait_launch else ""
-        proc = adb.run_adb(
-            ["shell", f"am start {wait_flag}-n {component}"],
-            serial=serial,
-            timeout=20.0,
+        start_cmd = f"am start {wait_flag}-n '{component}'"
+    else:
+        # Resolve the launcher activity on the device and start it with the launcher's
+        # NEW_TASK | RESET_TASK_IF_NEEDED, so a running app resumes like a home-screen tap.
+        # Replaces a full /packages listing (~0.5 s) and the `monkey` fallback (~3 s).
+        start_cmd = (
+            f"c=$(cmd package query-activities --brief {_LAUNCHER_INTENT} {pkg_name} | grep / | head -n 1 | tr -d ' '); "
+            f'if [ -z "$c" ]; then echo "Error: no launcher activity in {pkg_name}"; exit 1; fi; '
+            f'echo "component=$c"; am start {wait_flag}{_LAUNCHER_INTENT} -f 0x10200000 -n "$c"'
         )
-        out_text = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        if "Error:" in out_text or "Exception" in out_text:
-            raise RuntimeAxiError(
-                f"failed to launch {component}: {out_text.strip()}",
-                help_hints=[f"Run `{prefix} package {pkg_name}` to inspect package details"],
-            )
-        return {
-            "status": "launched",
-            "package": pkg_name,
-            "component": component,
-            "stopped_first": stop_first,
-        }
-
-    proc = adb.run_adb(
-        ["shell", f"monkey -p {pkg_name} -c android.intent.category.LAUNCHER 1"],
-        serial=serial,
-        timeout=15.0,
+    proc = adb.run_adb(["shell", start_cmd], serial=serial, timeout=20.0, check=False)
+    out_text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    for line in out_text.splitlines():
+        if line.startswith("component="):
+            component = line[len("component="):].strip()
+    # Only am's own failure lines count: "Starting: Intent { cmp=... }" echoes the component,
+    # which may itself be named like ".ExceptionViewer".
+    failed = any(
+        line.startswith(("Error", "Exception")) or "Exception:" in line
+        for line in (raw.strip() for raw in out_text.splitlines())
     )
-    out_text = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    if "No activities found" in out_text or "aborted" in out_text.lower():
+    if proc.returncode != 0 or failed:
+        no_launcher = "no launcher activity" in out_text
         raise RuntimeAxiError(
-            f"package {pkg_name} has no launchable activity",
+            f"package {pkg_name} has no launchable activity" if no_launcher else f"failed to launch {component or pkg_name}: {out_text}",
             help_hints=[f"Pass `--activity <COMPONENT>` or inspect `{prefix} package {pkg_name}`"],
         )
     return {
         "status": "launched",
         "package": pkg_name,
-        "component": "launcher-intent",
+        "component": component or "launcher-intent",
         "stopped_first": stop_first,
     }
 
@@ -1183,7 +1261,7 @@ def handle_batch(inv: ParsedInvocation) -> dict[str, Any]:
 
     sync_override = False if inv.flags["no_sync"] else None
     actions, sync = validate_batch_payload(raw_text, sync_override=sync_override)
-    with _make_client(inv.globals, timeout=30.0) as client:
+    with _make_client(inv.globals, timeout=max(30.0, _gesture_timeout(_batch_duration_ms(actions)))) as client:
         resp = client.post_batch(actions, sync=sync)
     result: dict[str, Any] = {
         "ok": bool(resp.get("ok", False)),

@@ -116,6 +116,8 @@ class _MockAgentServer(http.server.ThreadingHTTPServer):
         self.hierarchy_xml = MOCK_HIERARCHY_XML
         self.stopped = False
         self.screenshot_cache_hit = False
+        self.info_extra: dict[str, Any] = {}
+        self.input_ok = True
 
 
 class _MockAgentHandler(http.server.BaseHTTPRequestHandler):
@@ -158,6 +160,7 @@ class _MockAgentHandler(http.server.BaseHTTPRequestHandler):
                 "release": "14",
                 "agentVersion": "1.2.0",
                 "agentVersionCode": 12,
+                **self.server.info_extra,
             }
             self._send(200, json.dumps(data).encode("utf-8"), "application/json")
         elif parsed.path == "/hierarchy":
@@ -213,7 +216,8 @@ class _MockAgentHandler(http.server.BaseHTTPRequestHandler):
             if parsed.path in ("/input/tap", "/input/swipe", "/input/key", "/input/text", "/input/batch")
             else None
         )
-        self._send(200, b'{"ok":true}', "application/json", extra)
+        ok = self.server.input_ok if extra else True
+        self._send(200, b'{"ok":true}' if ok else b'{"ok":false}', "application/json", extra)
 
 
 class TestCommandsMock(unittest.TestCase):
@@ -230,7 +234,7 @@ class TestCommandsMock(unittest.TestCase):
     def _run(self, args: list[str]) -> tuple[int, str, str]:
         out = io.StringIO()
         err = io.StringIO()
-        code = main(["-p", str(self.port), *args], stdout=out, stderr=err)
+        code = main(["--host", "127.0.0.1", "-p", str(self.port), *args], stdout=out, stderr=err)
         return code, out.getvalue(), err.getvalue()
 
     def test_start_and_stop_idempotency(self) -> None:
@@ -259,7 +263,8 @@ class TestCommandsMock(unittest.TestCase):
             self.assertNotIn("MOCKJPEG", out)
             self.assertIn("width: 540", out)
             self.assertIn("height: 1200", out)
-            self.assertIn("source: virtual-display", out)
+            self.assertIn("source: uiautomation", out)
+            self.assertEqual(self.srv.requests[-1][2].get("fast"), "false")
             self.assertNotIn("cache_hit:", out)
             self.assertIn("coords_note:", out)
 
@@ -359,6 +364,43 @@ class TestCommandsMock(unittest.TestCase):
         self.assertIn("direction: left", out_fb)
         self.assertIn("x1: 810", out_fb)
         self.assertIn("x2: 270", out_fb)
+        shot_queries = [q for m, path, q in self.srv.requests if path == "/screenshot"]
+        self.assertTrue(shot_queries)
+        # The fallback must not start the agent's persistent VirtualDisplay mirror.
+        self.assertEqual(shot_queries[-1].get("fast"), "false")
+
+    def test_refused_injection_exits_nonzero(self) -> None:
+        # `ok: false` means nothing was injected; exit 0 would read as success.
+        self.srv.input_ok = False
+        code, out, _ = self._run(["tap", "10", "20"])
+        self.assertEqual(code, 1, msg=out)
+        self.assertIn("could not inject", out)
+        code_t, out_t, _ = self._run(["type", "中文"])
+        self.assertEqual(code_t, 1, msg=out_t)
+        self.assertIn("focused editable field", out_t)
+
+    def test_swipe_easing_and_info_display_size(self) -> None:
+        # Default easing is linear, matching `adb shell input swipe` so lists fling.
+        code, out, _ = self._run(["swipe", "500", "1800", "500", "400"])
+        self.assertEqual(code, 0, msg=out)
+        self.assertEqual(self.srv.requests[-1][1], "/input/swipe")
+        self.assertEqual(self.srv.requests[-1][2]["easing"], "linear")
+
+        code_e, _, _ = self._run(["swipe", "500", "1800", "500", "400", "--easing", "ease"])
+        self.assertEqual(code_e, 0)
+        self.assertEqual(self.srv.requests[-1][2]["easing"], "ease")
+
+        code_bad, out_bad, _ = self._run(["swipe", "up", "--easing", "bounce"])
+        self.assertEqual(code_bad, 2, msg=out_bad)
+
+        # /info's current-rotation size wins over a hierarchy dump.
+        self.srv.info_extra = {"width": 720, "height": 1640, "rotation": 0}
+        before = len(self.srv.requests)
+        code_i, out_i, _ = self._run(["swipe", "up", "--distance", "0.5"])
+        self.assertEqual(code_i, 0, msg=out_i)
+        self.assertIn("y1: 1230", out_i)
+        self.assertIn("y2: 410", out_i)
+        self.assertNotIn("/hierarchy", [path for _, path, _ in self.srv.requests[before:]])
 
     def test_key_global_and_batch_validation(self) -> None:
         code_k, out_k, _ = self._run(["key", "enter,back,KEYCODE_SPACE,66"])
@@ -422,17 +464,27 @@ class TestCommandsMock(unittest.TestCase):
         self.assertEqual(code_to, 1)
         self.assertIn("timed out after 0.15s", out_to)
 
-        # 3. launch resolves mainActivity from /packages and invokes adb am start.
+        # 3. launch resolves the launcher activity on the device and starts it with am start.
         with mock.patch("android_agent_cli.handlers.adb.resolve_serial", return_value="SER1"), mock.patch(
             "android_agent_cli.handlers.adb.run_adb"
         ) as mock_adb:
-            mock_adb.return_value = mock.Mock(returncode=0, stdout="Starting: Intent", stderr="")
+            mock_adb.return_value = mock.Mock(
+                returncode=0, stdout="component=com.example.userapp/.MainActivity\nStarting: Intent", stderr=""
+            )
             code_l, out_l, _ = self._run(["launch", "com.example.userapp", "--stop", "--wait"])
             self.assertEqual(code_l, 0, msg=out_l)
             self.assertIn("status: launched", out_l)
             self.assertIn("component: com.example.userapp/.MainActivity", out_l)
             self.assertIn("stopped_first: true", out_l)
             self.assertEqual(mock_adb.call_count, 2)
+            start_cmd = mock_adb.call_args_list[1].args[0][1]
+            self.assertIn("query-activities", start_cmd)
+            self.assertIn("-f 0x10200000", start_cmd)
+
+        # Package names reach a shell command, so anything outside the package grammar is refused.
+        code_bad, out_bad, _ = self._run(["launch", "com.example;reboot"])
+        self.assertEqual(code_bad, 2)
+        self.assertIn("invalid package name", out_bad)
 
     def test_packages_package_signature_icon_and_device(self) -> None:
         code_p, out_p, _ = self._run(["packages"])
@@ -473,16 +525,31 @@ class TestCommandsMock(unittest.TestCase):
         self.assertIn("--section sensors --full", out_sens)
 
     def test_status_and_devices_with_mocked_adb(self) -> None:
-        fake_devices = [adb.AdbDevice(serial="ABC123", state="device", model="IN2010", product="OnePlus8")]
-        with mock.patch("android_agent_cli.handlers.adb.list_devices", return_value=fake_devices):
-            code, out, _ = self._run(["status"])
-            self.assertEqual(code, 0)
-            self.assertIn("status: running", out)
-            self.assertIn("ABC123", out)
+        fake_devices = [
+            adb.AdbDevice(serial="ABC123", state="device", model="IN2010", product="OnePlus8"),
+            adb.AdbDevice(serial="XYZ789", state="device", model="Pixel", product="oriole"),
+        ]
+        # Per device: ABC123 runs an agent reachable through its own forward (the mock server),
+        # XYZ789 runs none. No forward may be created by status.
+        with mock.patch("android_agent_cli.handlers.adb.list_devices", return_value=fake_devices), mock.patch(
+            "android_agent_cli.handlers.adb.agent_process_running", side_effect=lambda s: s == "ABC123"
+        ), mock.patch(
+            "android_agent_cli.handlers.adb.find_forward", side_effect=lambda s, p: self.port if s == "ABC123" else None
+        ), mock.patch("android_agent_cli.handlers.adb.ensure_forward") as ensure:
+            out = io.StringIO()
+            code = main(["status"], stdout=out, stderr=io.StringIO())
+            text = out.getvalue()
+            self.assertEqual(code, 0, msg=text)
+            self.assertIn("ABC123", text)
+            self.assertIn("XYZ789", text)
+            self.assertIn("running", text)
+            self.assertIn("stopped", text)
+            self.assertIn("agentVersion", text)
+            ensure.assert_not_called()
 
             code_d, out_d, _ = self._run(["devices"])
             self.assertEqual(code_d, 0)
-            self.assertIn("count: 1 connected", out_d)
+            self.assertIn("count: 2 connected", out_d)
 
     def test_adb_find_sdk_fallback_and_push_jar_sha256(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

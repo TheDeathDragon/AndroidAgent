@@ -136,6 +136,10 @@ def list_devices(timeout: float = 10.0) -> list[AdbDevice]:
 def resolve_serial(requested: str | None, timeout: float = 10.0) -> str:
     if requested:
         return requested
+    # adb itself honours ANDROID_SERIAL; with several devices attached it is how users pick one.
+    env_serial = os.environ.get("ANDROID_SERIAL", "").strip()
+    if env_serial:
+        return env_serial
     devices = list_devices(timeout=timeout)
     if not devices:
         raise RuntimeAxiError(
@@ -255,9 +259,48 @@ def push_jar(serial: str, local_jar: Path, remote_path: str = REMOTE_JAR_PATH) -
     return True
 
 
-def forward_port(serial: str, local_port: int, remote_port: int | None = None) -> None:
-    target_port = local_port if remote_port is None else remote_port
-    run_adb(["forward", f"tcp:{local_port}", f"tcp:{target_port}"], serial=serial, timeout=5.0)
+def all_forwards(serial: str, remote_port: int) -> list[int]:
+    proc = run_adb(["forward", "--list"], timeout=5.0, check=False)
+    ports: list[int] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == serial and parts[2] == f"tcp:{remote_port}" and parts[1].startswith("tcp:"):
+            try:
+                ports.append(int(parts[1][4:]))
+            except ValueError:
+                continue
+    return ports
+
+
+def find_forward(serial: str, remote_port: int) -> int | None:
+    ports = all_forwards(serial, remote_port)
+    return ports[0] if ports else None
+
+
+def ensure_forward(serial: str, remote_port: int) -> int:
+    # `adb forward` is global to the adb server: a fixed host port (the old 9500 -> 9500)
+    # is silently taken over by whichever tool forwards it last, and commands then reach
+    # another phone. Reuse this device's existing forward, else let adb pick a free port.
+    existing = find_forward(serial, remote_port)
+    if existing is not None:
+        return existing
+    proc = run_adb(["forward", "tcp:0", f"tcp:{remote_port}"], serial=serial, timeout=5.0)
+    try:
+        port = int(proc.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeAxiError(f"unexpected `adb forward tcp:0` output: {proc.stdout.strip()!r}") from exc
+    # run_adb retries on timeout; if the first attempt had already created a forward, or a
+    # parallel invocation raced this one, keep one and drop the extras.
+    for extra in all_forwards(serial, remote_port):
+        if extra != port:
+            remove_forward(serial, extra)
+    return port
+
+
+def agent_process_running(serial: str) -> bool:
+    # [S]erver keeps the pattern from matching the shell that runs pgrep.
+    proc = run_adb(["shell", "pgrep -f 'la.shiro.agent.[S]erver'"], serial=serial, timeout=5.0, check=False)
+    return bool(proc.stdout.strip())
 
 
 def remove_forward(serial: str | None, local_port: int) -> None:

@@ -81,10 +81,12 @@ class TestParser(unittest.TestCase):
             parse_argv(["unknown-cmd"])
 
     def test_negated_bool_flag(self) -> None:
-        inv = parse_argv(["screen", "--no-fast"])
-        self.assertFalse(inv.flags["fast"])
+        inv = parse_argv(["screen", "--fast"])
+        self.assertTrue(inv.flags["fast"])
+        self.assertFalse(parse_argv(["screen", "--fast", "--no-fast"]).flags["fast"])
+        # Off by default: a live mirror makes the device compose an extra display every frame.
         inv_default = parse_argv(["screen"])
-        self.assertTrue(inv_default.flags["fast"])
+        self.assertFalse(inv_default.flags["fast"])
 
 
 if __name__ == "__main__":
