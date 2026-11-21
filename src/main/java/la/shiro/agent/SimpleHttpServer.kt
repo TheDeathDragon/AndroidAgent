@@ -2,6 +2,9 @@ package la.shiro.agent
 
 import android.app.UiAutomation
 import android.content.Context
+import android.graphics.Point
+import android.hardware.display.DisplayManagerGlobal
+import android.os.Trace
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -172,7 +175,22 @@ class SimpleHttpServer(
         }
     }
 
+    // One atrace section per request so a Perfetto trace (atrace_apps: "app_process")
+    // shows each endpoint's on-device time next to the input and render work it causes.
     private fun dispatch(
+        request: HttpRequest,
+        output: BufferedOutputStream,
+        keepAlive: Boolean
+    ): Boolean {
+        Trace.beginSection("agent ${request.path}")
+        try {
+            return dispatchTraced(request, output, keepAlive)
+        } finally {
+            Trace.endSection()
+        }
+    }
+
+    private fun dispatchTraced(
         request: HttpRequest,
         output: BufferedOutputStream,
         keepAlive: Boolean
@@ -362,8 +380,24 @@ class SimpleHttpServer(
             put("release", android.os.Build.VERSION.RELEASE)
             put("agentVersion", BuildConfig.VERSION_NAME)
             put("agentVersionCode", BuildConfig.VERSION_CODE)
+            putDisplay(this)
         }.toString()
         return HttpResponse.text(HttpStatus.OK, json, "application/json; charset=utf-8")
+    }
+
+    // Current-rotation size, so hosts can compute gesture coordinates without dumping the
+    // whole hierarchy. /info doubles as the hosts' liveness probe, so a hidden-API failure
+    // on an odd ROM only drops these fields.
+    private fun putDisplay(json: JSONObject) {
+        try {
+            val display = DisplayManagerGlobal.getInstance().getRealDisplay(0) ?: return
+            val size = Point()
+            display.getRealSize(size)
+            json.put("width", size.x)
+            json.put("height", size.y)
+            json.put("rotation", display.rotation)
+        } catch (_: Throwable) {
+        }
     }
 
     private fun handleDeviceInfo(): HttpResponse {

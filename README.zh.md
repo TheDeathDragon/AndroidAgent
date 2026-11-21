@@ -65,9 +65,11 @@ curl http://127.0.0.1:9500/health
 | POST     | `/input/batch`                | JSON `{"ok":true}` (JSON 请求体 `{"actions":[...],"sync":true}` 或 `[...]`; 支持 `down`/`move`/`up`/`tap`/`swipe`/`wait`/`key`/`text`/`global`) |
 | GET      | `/packages?user_only=false`   | JSON 数组                                                         |
 | GET      | `/icon?pkg=<name>`            | `image/png`                                                       |
-| GET      | `/signature?pkg=<name>`       | 文本 (V1/V2/V3/V4 签名方案)                                       |
+| GET      | `/signature?pkg=<name>`       | 文本 (V1/V2/V3/V4 签名方案)；包未安装时返回 404                   |
 | GET      | `/device-info`                | JSON (14 段设备画像)                                              |
-| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`version`)                            |
+| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`release`/`agentVersion`/`agentVersionCode`，以及当前旋转方向下的 `width`/`height`/`rotation`) |
+| GET      | `/locales`                    | JSON（`current` 和支持的 `locales`）                              |
+| GET      | `/set-locale?tag=<bcp47>`     | JSON；缺少或非法 tag 时返回 400 `{"ok":false,"error":...}`        |
 | GET      | `/stop`                       | 文本 `stopping` (优雅关停)                                        |
 
 ### `/screenshot` 参数与响应头
@@ -82,6 +84,7 @@ curl http://127.0.0.1:9500/health
 ### `/input/*` 响应头
 
 - 响应体固定为 `{"ok":true}` 或 `{"ok":false}`
+- `/input/swipe`（以及 batch 里的 `swipe`）支持 `easing`：`ease`（默认）在 `ACTION_UP` 前减速到接近零，列表不会惯性滚动；`linear` 与 `adb shell input swipe` 一致，会惯性滚动。不要用 batch 拼 `move` 步骤代替：`sync=true` 时每个 `move` 都要等应用处理完，手势会被拉长。
 - 响应头: `X-Input-Source` (走直连 `InputManager` / `InputManagerGlobal` 时为 `direct`, 回退或 `/input/global` 时为 `uiautomation`)
 
 ## AXI 命令行工具与 Agent Skill

@@ -98,15 +98,23 @@ class UiHierarchy(private val uiAutomation: UiAutomation) {
         serializer.endTag(NS, "node")
     }
 
+    // Walks code points, not chars: a surrogate pair (emoji, rare CJK) is a legal XML
+    // character, while each half on its own is not. Only lone surrogates and control
+    // characters are replaced.
     private fun sanitize(cs: CharSequence?): String {
         if (cs == null) return ""
-        val sb = StringBuilder(cs.length)
-        for (ch in cs) {
-            if (isValidXmlChar(ch)) {
-                sb.append(ch)
-            } else {
-                sb.append('.')
+        val s = cs.toString()
+        val sb = StringBuilder(s.length)
+        var i = 0
+        while (i < s.length) {
+            val ch = s[i]
+            if (Character.isHighSurrogate(ch) && i + 1 < s.length && Character.isLowSurrogate(s[i + 1])) {
+                sb.append(ch).append(s[i + 1])
+                i += 2
+                continue
             }
+            sb.append(if (isValidXmlChar(ch)) ch else '.')
+            i++
         }
         return sb.toString()
     }

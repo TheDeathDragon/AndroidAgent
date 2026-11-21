@@ -63,7 +63,8 @@ sealed class InputAction {
         val y2: Float,
         val durationMs: Long = 300L,
         val steps: Int? = null,
-        val holdMs: Long = 0L
+        val holdMs: Long = 0L,
+        val linear: Boolean = false
     ) : InputAction()
     data class Wait(val durationMs: Long) : InputAction()
     data class Key(
@@ -435,7 +436,9 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
         try {
             for (step in 1..totalSteps) {
                 val t = step.toFloat() / totalSteps.toFloat()
-                val eased = 0.5f * (1f - cos(PI * t).toFloat())
+                // Linear matches `adb shell input swipe`: the pointer still moves at full
+                // speed on ACTION_UP, so lists fling. The eased curve ends near zero velocity.
+                val eased = if (swipe.linear) t else 0.5f * (1f - cos(PI * t).toFloat())
                 val cx = swipe.x1 + (swipe.x2 - swipe.x1) * eased
                 val cy = swipe.y1 + (swipe.y2 - swipe.y1) * eased
                 if (swipe.durationMs > 0L) {
@@ -710,8 +713,9 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
             }
             val holdMs = optionalLong(json, request.query, "hold", "holdMs") ?: 0L
             validateRange(holdMs, 0L, MAX_HOLD_MS, "holdMs")
+            val linear = parseLinearEasing(json, request.query)
             val sync = optionalBoolean(json, request.query, "sync") ?: true
-            return InputCommand(InputAction.Swipe(x1, y1, x2, y2, durationMs, steps, holdMs), sync)
+            return InputCommand(InputAction.Swipe(x1, y1, x2, y2, durationMs, steps, holdMs, linear), sync)
         }
 
         fun parseKey(request: HttpRequest): InputCommand {
@@ -836,7 +840,8 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
                         y2 = requireFloat(obj, emptyMap(), "y2"),
                         durationMs = durationMs,
                         steps = steps,
-                        holdMs = holdMs
+                        holdMs = holdMs,
+                        linear = parseLinearEasing(obj, emptyMap())
                     )
                 }
                 "wait" -> {
@@ -947,6 +952,19 @@ class InputController(private val uiAutomation: UiAutomation) : AutoCloseable {
                 throw BadRequestException("integer overflow for ${keys.first()}: $value")
             }
             return value.toInt()
+        }
+
+        private fun parseLinearEasing(json: JSONObject?, query: Map<String, String>): Boolean {
+            val raw: String = if (json != null && json.has("easing") && !json.isNull("easing")) {
+                json.get("easing").toString()
+            } else {
+                query["easing"] ?: return false
+            }
+            return when (raw.trim().lowercase(Locale.US)) {
+                "linear" -> true
+                "ease", "ease-in-out" -> false
+                else -> throw BadRequestException("invalid easing: $raw (expected linear or ease)")
+            }
         }
 
         private fun optionalBoolean(

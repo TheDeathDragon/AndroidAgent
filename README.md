@@ -66,9 +66,11 @@ All endpoints support HTTP/1.1 Keep-Alive (up to 1000 requests per connection, 1
 | POST     | `/input/batch`                | JSON `{"ok":true}` (JSON body `{"actions":[...],"sync":true}` or `[...]`; types: `down`, `move`, `up`, `tap`, `swipe`, `wait`, `key`, `text`, `global`) |
 | GET      | `/packages?user_only=false`   | JSON array                                                        |
 | GET      | `/icon?pkg=<name>`            | `image/png`                                                       |
-| GET      | `/signature?pkg=<name>`       | text (V1/V2/V3/V4 schemes)                                        |
+| GET      | `/signature?pkg=<name>`       | text (V1/V2/V3/V4 schemes); 404 when the package is not installed |
 | GET      | `/device-info`                | JSON (14-section profile)                                         |
-| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`version`)                            |
+| GET      | `/info`                       | JSON (`brand`/`model`/`sdk`/`release`/`agentVersion`/`agentVersionCode`, plus current-rotation `width`/`height`/`rotation`) |
+| GET      | `/locales`                    | JSON (`current` + supported `locales`)                            |
+| GET      | `/set-locale?tag=<bcp47>`     | JSON; 400 with `{"ok":false,"error":...}` for a missing or invalid tag |
 | GET      | `/stop`                       | text `stopping` (clean shutdown)                                  |
 
 ### `/screenshot` parameters and headers
@@ -83,6 +85,7 @@ All endpoints support HTTP/1.1 Keep-Alive (up to 1000 requests per connection, 1
 ### `/input/*` headers
 
 - Response body is always `{"ok":true}` or `{"ok":false}`
+- `/input/swipe` (and batch `swipe`) takes `easing`: `ease` (default) slows to near zero velocity before `ACTION_UP`, so lists do not fling; `linear` matches `adb shell input swipe` and flings. Prefer it over composing `move` steps in a batch: with `sync=true` every batched `move` waits for the app to consume it, which stretches the gesture.
 - Response header: `X-Input-Source` (`direct` when injected via `InputManager` / `InputManagerGlobal`, or `uiautomation` on fallback or `/input/global`)
 
 ## AXI CLI & Agent Skill
